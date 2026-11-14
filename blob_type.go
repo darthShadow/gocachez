@@ -11,7 +11,6 @@ import (
 	"sync"
 	"unicode/utf8"
 
-	"github.com/klauspost/compress/zstd"
 	"zombiezen.com/go/sqlite"
 )
 
@@ -66,22 +65,22 @@ type blobClassification struct {
 	kind blobTypeKind
 }
 
-func readBlobTypeStatus(dbPath, blobsDir string) ([]blobTypeStatus, error) {
+func readBlobTypeStatus(dbPath, outputsDir string) ([]blobTypeStatus, error) {
 	_, _, outputs, err := readCatalogStatus(dbPath)
 	if err != nil {
 		return nil, err
 	}
-	return blobTypeStatuses(dbPath, blobsDir, outputs), nil
+	return blobTypeStatuses(dbPath, outputsDir, outputs), nil
 }
 
 // blobTypeStatuses classifies the given catalog outputs into the per-kind
-// breakdown, decompressing only blobs without a current cached classification
+// breakdown, reading only stored files without a current cached classification
 // and best-effort caching any it computes.
-func blobTypeStatuses(dbPath, blobsDir string, outputs []catalogOutput) []blobTypeStatus {
-	byKind, classified := classifyBlobTypes(blobsDir, outputs)
+func blobTypeStatuses(dbPath, outputsDir string, outputs []catalogOutput) []blobTypeStatus {
+	byKind, classified := classifyBlobTypes(outputsDir, outputs)
 	if len(classified) > 0 {
-		// Best effort: cache the classifications so later runs skip
-		// decompressing these blobs. Ignore failures (e.g. a read-only cache).
+		// Best effort: cache the classifications so later runs skip reading
+		// these files. Ignore failures (e.g. a read-only cache).
 		_ = persistBlobTypes(dbPath, classified)
 	}
 
@@ -139,11 +138,10 @@ type blobTypeResult struct {
 	classification blobClassification
 }
 
-// classifyBlobTypes aggregates the blobs for outputs by classification. Outputs
-// carrying a cached classification (blobType) reuse it; the rest are
-// decompressed and classified in parallel, and returned so the caller can cache
-// them.
-func classifyBlobTypes(blobsDir string, outputs []catalogOutput) (map[blobTypeKind]*blobTypeStatus, map[string]blobTypeKind) {
+// classifyBlobTypes aggregates the stored files for outputs by classification.
+// Outputs carrying a cached classification (blobType) reuse it; the rest are
+// read and classified in parallel, and returned so the caller can cache them.
+func classifyBlobTypes(outputsDir string, outputs []catalogOutput) (map[blobTypeKind]*blobTypeStatus, map[string]blobTypeKind) {
 	byKind := make(map[blobTypeKind]*blobTypeStatus)
 	classified := make(map[string]blobTypeKind)
 
@@ -166,18 +164,10 @@ func classifyBlobTypes(blobsDir string, outputs []catalogOutput) (map[blobTypeKi
 	var wg sync.WaitGroup
 	for range workers {
 		wg.Go(func() {
-			var decoder *zstd.Decoder
-			defer func() {
-				if decoder != nil {
-					decoder.Close()
-				}
-			}()
 			for output := range jobs {
-				var classification blobClassification
-				classification, decoder = classifyCompressedBlob(blobPath(blobsDir, output.outputID), decoder)
 				results <- blobTypeResult{
 					output:         output,
-					classification: classification,
+					classification: classifyStoredFile(storedPath(outputsDir, output.outputID)),
 				}
 			}
 		})
@@ -215,31 +205,20 @@ func addBlobType(byKind map[blobTypeKind]*blobTypeStatus, kind blobTypeKind, out
 	status.compressedSize += output.compressedSize
 }
 
-func classifyCompressedBlob(path string, decoder *zstd.Decoder) (blobClassification, *zstd.Decoder) {
+// classifyStoredFile classifies the first blobTypePrefixLimit bytes of a stored
+// file. The kernel decompresses them on read.
+func classifyStoredFile(path string) blobClassification {
 	file, err := os.Open(path)
 	if err != nil {
-		return blobClassification{kind: blobTypeUnreadable}, decoder
+		return blobClassification{kind: blobTypeUnreadable}
 	}
 	defer file.Close() //nolint:errcheck
 
-	if decoder == nil {
-		decoder, err = zstd.NewReader(file, decoderOptions...)
-	} else {
-		err = decoder.Reset(file)
-	}
+	data, err := io.ReadAll(io.LimitReader(file, blobTypePrefixLimit))
 	if err != nil {
-		if decoder != nil {
-			decoder.Close()
-		}
-		return blobClassification{kind: blobTypeUnreadable}, nil
+		return blobClassification{kind: blobTypeUnreadable}
 	}
-
-	data, err := io.ReadAll(io.LimitReader(decoder, blobTypePrefixLimit))
-	if err != nil {
-		decoder.Close()
-		return blobClassification{kind: blobTypeUnreadable}, nil
-	}
-	return classifyBlobData(data), decoder
+	return classifyBlobData(data)
 }
 
 func classifyBlobData(data []byte) blobClassification {

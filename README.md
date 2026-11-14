@@ -1,12 +1,15 @@
 # gocachez
 
 `gocachez` is a [`GOCACHEPROG`](https://pkg.go.dev/cmd/go/internal/cacheprog)
-helper for the Go build cache. It stores cache artifacts as zstd-compressed
-files, materializes uncompressed files for the Go command on demand, and evicts
-old compressed entries automatically.
+helper for the Go build cache. It stores each cache artifact as one
+file-system-compressed file (APFS, LZFSE), hands that file to the Go command as
+is, and evicts old entries automatically. It runs on macOS only.
 
 This project was inspired by the discussion on
 [`golang/go#76337`](https://github.com/golang/go/issues/76337).
+
+The two tables below are the upstream project's measurements of its
+zstd-compressed design. They do not describe this fork.
 
 Go `std`:
 
@@ -26,10 +29,15 @@ Go `std`:
 
 ## Installation
 
-Requires Go 1.25 or newer.
+Requires macOS, cgo, and Go 1.25 or newer.
+
+`GOCACHE` must be a path prefix of the stored files, which sit under
+`<cache directory>/v2/outputs/`. For example, set `GOCACHE` to the cache
+directory. The Go command copies a cached file only when its path is under
+`GOCACHE`, and otherwise moves it out of the store.
 
 ```console
-$ go install github.com/jakebailey/gocachez@latest
+$ go install github.com/darthshadow/gocachez@latest
 $ go env -w GOCACHEPROG=gocachez
 ```
 
@@ -59,8 +67,8 @@ Remove inactive cache state:
 $ gocachez clean
 ```
 
-`clean` removes blobs, live files, and catalog state that no active `gocachez`
-process is using. State for active live runs is preserved.
+`clean` removes the stored files and catalog state that no active `gocachez`
+process is using. Nothing is removed while a run is active.
 
 Show cache state:
 
@@ -78,38 +86,34 @@ and `get` requests when it wants to retrieve one.
 
 On `put`, `gocachez`:
 
-1. streams the artifact body into a zstd encoder,
-2. writes the compressed bytes into `blobs/`,
-3. writes the uncompressed body into the current run's `live/` directory, and
-4. returns that live file path to the Go command as `DiskPath`.
+1. streams the artifact body in 64 KiB chunks into LZFSE (libcompression),
+2. writes the compressed chunks as the file's `com.apple.decmpfs` and resource
+   fork attributes into a temp file, and sets `UF_COMPRESSED`,
+3. makes the file read-only (0444) and publishes it at
+   `v2/outputs/<first two hex digits>/<output ID>`, and
+4. returns that path to the Go command as `DiskPath`.
 
-The compressed blob is the durable cache entry. The live file is only the
-temporary uncompressed file the Go command needs in order to read the artifact
-from disk.
+The file system decompresses the file when the Go command reads it. No plain
+copy is written. A body of 2 GiB or more is rejected.
 
-On `get`, `gocachez` looks up the action ID in SQLite. On a hit, it opens the
-compressed blob, decompresses it into the current run's `live/` directory, and
-returns the materialized path as `DiskPath`.
+On `get`, `gocachez` looks up the action ID in SQLite. On a hit, it returns the
+stored path as `DiskPath` and writes nothing. The Go command checks the file
+itself and treats a missing or wrong-sized file as a miss.
 
-Live files are removed when the `GOCACHEPROG` process closes. If `gocachez`
-exits abnormally, a later run can safely clean up abandoned live files: each run
-holds an OS file lock, and another process only reclaims a run directory after
-it can acquire that lock.
+The stored file is the only copy, so a path that `gocachez` returned can outlive
+the helper: `go list -export` reports an `Export` path that tools such as
+`go/packages` and `golangci-lint` open after the Go command has closed its
+`GOCACHEPROG` helper. Two rules protect those paths:
 
-Some live files can escape the Go command process through `go list` output. For
-example, `go list -export` reports an `Export` path that tools such as
-`go/packages` and `golangci-lint` may open after the Go command has closed its
-`GOCACHEPROG` helper. `go list -compiled` can also report generated cgo source
-paths in `CompiledGoFiles`, and `go list -test` can report a generated
-`_testmain.go` path in the synthetic test main package's `GoFiles`.
+- No file is deleted while any `gocachez` process is running.
+- No output is deleted within 1 hour after its last use.
 
-To support those tools without keeping large uncompressed archives around,
-`gocachez` treats these escaped files specially on close. Package archives are
-replaced with small archives containing only their `__.PKGDEF` export data.
-Standalone indexed export data and generated Go source files that can appear in
-list output are retained as-is. These retained files are stored under
-`retained/`, keyed by output ID, and are cleaned up once no catalog entry
-references that output.
+Each run holds an OS file lock. If `gocachez` exits abnormally, a later run
+reclaims the abandoned run directory once it can acquire that lock.
+
+Once an hour, with no run active, `gocachez` removes temp files and files with
+no catalog entry that are older than 1 hour, then sets its size counter to the
+bytes on disk (`st_blocks`) under `v2/`.
 
 ## Configuration
 
@@ -155,12 +159,15 @@ Supported options:
 - Flag: `-dir`
 - Default: `os.UserCacheDir()/gocachez`
 
-**Maximum compressed cache size**
+**Maximum cache size on disk**
 
 - Config: `maxSize`
 - Environment: `GOCACHEZ_MAX_SIZE`
 - Flag: `-max-size`
 - Default: `20GiB`; `0` disables size-based pruning.
+  The limit counts the bytes on disk under `v2/`, catalog included. The total
+  can pass it while a run is active or an output is inside the 1 hour window.
+  The next prune then trims it to 90 percent of the limit.
 
 **Maximum age of unused entries**
 
@@ -170,7 +177,7 @@ Supported options:
 - Default: `5d`, matching `cmd/go`'s `GOCACHE`; `0` disables age-based pruning.
   Accepts a duration such as `5d`, `36h`, or `90m`.
 
-Age-based pruning is independent of `maxSize`: entries and retained files that
+Age-based pruning is independent of `maxSize`: entries that
 have not been used within `maxAge` are trimmed even while the cache is under its
 size limit.
 

@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 
@@ -17,7 +16,7 @@ import (
 	"zombiezen.com/go/sqlite/sqlitex"
 )
 
-const cacheSchemaVersion = 1
+const cacheSchemaVersion = 2
 
 const catalogSchema = `
 CREATE TABLE IF NOT EXISTS entries (
@@ -28,9 +27,7 @@ CREATE TABLE IF NOT EXISTS entries (
 	created_at INTEGER NOT NULL,
 	accessed_at INTEGER NOT NULL,
 	blob_type INTEGER,
-	blob_type_version INTEGER,
-	retained_type INTEGER,
-	retained_type_version INTEGER
+	blob_type_version INTEGER
 );
 CREATE INDEX IF NOT EXISTS entries_accessed_at ON entries(accessed_at);
 
@@ -62,28 +59,24 @@ type store struct {
 	db                *sqliteDB
 	q                 *catalog
 	versionDir        string
-	blobsDir          string
+	outputsDir        string
 	liveRoot          string
 	lifecycleLockPath string
 	runID             string
 	runDir            string
 	runLock           *flock.Flock
 	mu                sync.Mutex
-	bodyWriterPool    sync.Pool
-	encoderPool       sync.Pool
-	decoderPool       sync.Pool
-	materialized      map[string]string
-	materializing     map[string]*materialization
 	accessed          map[string]int64
 	lastAccessFlush   time.Time
+
+	// Test seams. newStore sets each to the real call.
+	chtimes           func(name string, atime, mtime time.Time) error
+	setCompressedFlag func(fd int) error
+	flushAccess       func() error
 }
 
-const retainedDirName = "retained"
-
-var retainedFileExtensions = []string{".a", ".go", ".i"}
-
 func newStore(cfg config) (*store, error) {
-	versionDir, blobsDir, liveRoot, lifecycleLockPath := cachePaths(cfg)
+	versionDir, outputsDir, liveRoot, lifecycleLockPath := cachePaths(cfg)
 	if err := os.MkdirAll(versionDir, 0o777); err != nil {
 		return nil, fmt.Errorf("create version dir: %w", err)
 	}
@@ -91,7 +84,7 @@ func newStore(cfg config) (*store, error) {
 	var st *store
 	err := withFileLock(lifecycleLockPath, func() error {
 		var err error
-		st, err = newStoreLocked(cfg, versionDir, blobsDir, liveRoot, lifecycleLockPath)
+		st, err = newStoreLocked(cfg, versionDir, outputsDir, liveRoot, lifecycleLockPath)
 		return err
 	})
 	if err != nil {
@@ -106,7 +99,7 @@ func newStore(cfg config) (*store, error) {
 func cachePaths(cfg config) (string, string, string, string) {
 	versionDir := cacheVersionDir(cfg)
 	return versionDir,
-		filepath.Join(versionDir, "blobs"),
+		filepath.Join(versionDir, "outputs"),
 		filepath.Join(versionDir, "live"),
 		filepath.Join(versionDir, "lifecycle.lock")
 }
@@ -115,13 +108,9 @@ func cacheVersionDir(cfg config) string {
 	return filepath.Join(cfg.dir, fmt.Sprintf("v%d", cacheSchemaVersion))
 }
 
-func retainedRoot(versionDir string) string {
-	return filepath.Join(versionDir, retainedDirName)
-}
-
-func newStoreLocked(cfg config, versionDir, blobsDir, liveRoot, lifecycleLockPath string) (*store, error) {
-	if err := os.MkdirAll(blobsDir, 0o777); err != nil {
-		return nil, fmt.Errorf("create blobs dir: %w", err)
+func newStoreLocked(cfg config, versionDir, outputsDir, liveRoot, lifecycleLockPath string) (*store, error) {
+	if err := os.MkdirAll(outputsDir, 0o777); err != nil {
+		return nil, fmt.Errorf("create outputs dir: %w", err)
 	}
 	if err := os.MkdirAll(liveRoot, 0o777); err != nil {
 		return nil, fmt.Errorf("create live dir: %w", err)
@@ -150,17 +139,18 @@ func newStoreLocked(cfg config, versionDir, blobsDir, liveRoot, lifecycleLockPat
 		db:                db,
 		q:                 newCatalog(db),
 		versionDir:        versionDir,
-		blobsDir:          blobsDir,
+		outputsDir:        outputsDir,
 		liveRoot:          liveRoot,
 		lifecycleLockPath: lifecycleLockPath,
 		runID:             runID,
 		runDir:            runDir,
 		runLock:           runLock,
-		materialized:      make(map[string]string),
-		materializing:     make(map[string]*materialization),
 		accessed:          make(map[string]int64),
 		lastAccessFlush:   time.Now(),
+		chtimes:           os.Chtimes,
+		setCompressedFlag: setUFCompressed,
 	}
+	st.flushAccess = st.flushAccessTimes
 	if err := st.registerRun(); err != nil {
 		_ = db.Close()
 		_ = runLock.Unlock()
@@ -229,8 +219,6 @@ func migrateSchema(conn *sqlite.Conn) error {
 	for _, col := range []struct{ name, ddl string }{
 		{"blob_type", "blob_type INTEGER"},
 		{"blob_type_version", "blob_type_version INTEGER"},
-		{"retained_type", "retained_type INTEGER"},
-		{"retained_type_version", "retained_type_version INTEGER"},
 	} {
 		has, err := entriesHasColumn(conn, col.name)
 		if err != nil {
@@ -253,7 +241,7 @@ func migrateSchema(conn *sqlite.Conn) error {
 		if err := execute(conn, `DROP INDEX IF EXISTS entries_output_cover`); err != nil {
 			return fmt.Errorf("drop stale entries_output_cover index: %w", err)
 		}
-		if err := execute(conn, `CREATE INDEX entries_output_cover ON entries(output_id, compressed_size, size, blob_type, blob_type_version, retained_type, retained_type_version)`); err != nil {
+		if err := execute(conn, `CREATE INDEX entries_output_cover ON entries(output_id, compressed_size, size, blob_type, blob_type_version)`); err != nil {
 			return fmt.Errorf("create entries_output_cover index: %w", err)
 		}
 	}
@@ -270,8 +258,6 @@ func statusCoverIndexCurrent(conn *sqlite.Conn) (bool, error) {
 		"size",
 		"blob_type",
 		"blob_type_version",
-		"retained_type",
-		"retained_type_version",
 	}
 	var got []string
 	err := sqlitex.Execute(conn, `SELECT name FROM pragma_index_info('entries_output_cover') ORDER BY seqno`, &sqlitex.ExecOptions{
@@ -287,14 +273,21 @@ func statusCoverIndexCurrent(conn *sqlite.Conn) (bool, error) {
 }
 
 func (st *store) close() {
-	if err := st.flushAccessTimes(); err != nil && st.verbose {
-		log.Printf("gocachez: flush access times failed: %v", err)
+	flushErr := st.flushAccess()
+	if flushErr != nil && st.verbose {
+		log.Printf("gocachez: flush access times failed: %v", flushErr)
 	}
 	if err := st.unregisterRun(); err != nil && st.verbose {
 		log.Printf("gocachez: unregister run failed: %v", err)
 	}
-	if err := st.pruneAutomatically(time.Now()); err != nil && st.verbose {
-		log.Printf("gocachez: prune failed: %v", err)
+	// After a failed flush the catalog holds stale last-use times, and the floor
+	// reads them. Skip the prune; the next idle close prunes. The unflushed times
+	// live only in memory and are lost at exit, so a later helper's idle close can
+	// still prune those outputs inside the hour.
+	if flushErr == nil {
+		if err := st.pruneAutomatically(time.Now()); err != nil && st.verbose {
+			log.Printf("gocachez: prune failed: %v", err)
+		}
 	}
 	if err := st.db.Close(); err != nil && st.verbose {
 		log.Printf("gocachez: close catalog failed: %v", err)
@@ -314,149 +307,16 @@ func (st *store) unregisterRun() error {
 	if deleteErr := st.q.deleteRun(context.Background(), st.runID); deleteErr != nil {
 		err = errors.Join(err, fmt.Errorf("delete run record: %w", deleteErr))
 	}
-	retainedLiveFiles, prepareErr := st.prepareLiveRunForClose()
-	if prepareErr != nil {
-		err = errors.Join(err, prepareErr)
-	}
-	if retainedLiveFiles && prepareErr == nil {
-		now := time.Now()
-		if touchErr := os.Chtimes(st.runLock.Path(), now, now); touchErr != nil {
-			err = errors.Join(err, fmt.Errorf("timestamp retained live run: %w", touchErr))
-		}
-	}
 	if unlockErr := st.runLock.Unlock(); unlockErr != nil {
 		err = errors.Join(err, fmt.Errorf("unlock live run: %w", unlockErr))
 	}
 	if closeErr := st.runLock.Close(); closeErr != nil {
 		err = errors.Join(err, fmt.Errorf("close live run lock: %w", closeErr))
 	}
-	if !retainedLiveFiles {
-		if removeErr := os.RemoveAll(st.runDir); removeErr != nil {
-			err = errors.Join(err, fmt.Errorf("remove live run dir: %w", removeErr))
-		}
+	if removeErr := os.RemoveAll(st.runDir); removeErr != nil {
+		err = errors.Join(err, fmt.Errorf("remove live run dir: %w", removeErr))
 	}
 	return err
-}
-
-func (st *store) prepareLiveRunForClose() (bool, error) {
-	entries, err := os.ReadDir(st.runDir)
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("read live run dir: %w", err)
-	}
-
-	retained := false
-	for _, entry := range entries {
-		if entry.Name() == "run.lock" {
-			continue
-		}
-		path := filepath.Join(st.runDir, entry.Name())
-		if !entry.Type().IsRegular() {
-			if err := os.RemoveAll(path); err != nil {
-				return false, fmt.Errorf("remove live path: %w", err)
-			}
-			continue
-		}
-		stripped, err := st.stripLivePackageArchiveToExport(path)
-		if err != nil {
-			return false, err
-		}
-		if stripped {
-			retained = true
-			continue
-		}
-		indexed, err := st.retainLiveIndexedExportData(path)
-		if err != nil {
-			return false, err
-		}
-		if indexed {
-			retained = true
-			continue
-		}
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return false, fmt.Errorf("remove live file: %w", err)
-		}
-	}
-	return retained, nil
-}
-
-func (st *store) stripLivePackageArchiveToExport(path string) (bool, error) {
-	outputID := liveOutputID(path)
-	if outputID == "" {
-		return stripPackageArchiveToExport(path, "")
-	}
-	onCopyFallback := func() {
-		if st.verbose {
-			log.Printf("gocachez: hard link unavailable for retained file %s; copying instead", outputID)
-		}
-	}
-	retained, err := stripPackageArchiveToExportWithFallback(path, st.retainedPath(outputID, ".a"), onCopyFallback)
-	if err != nil {
-		return false, err
-	}
-	if retained {
-		if err := st.q.updateRetainedType(context.Background(), outputID, retainedTypeExportArchive); err != nil {
-			if st.verbose {
-				log.Printf("gocachez: cache retained file type failed: %v", err)
-			}
-		}
-		return true, nil
-	}
-	kind, retained, err := retainEscapedGeneratedGoSourceWithFallback(path, st.retainedPath(outputID, ".go"), onCopyFallback)
-	if err != nil || !retained {
-		return retained, err
-	}
-	if err := st.q.updateRetainedType(context.Background(), outputID, kind); err != nil {
-		if st.verbose {
-			log.Printf("gocachez: cache retained file type failed: %v", err)
-		}
-	}
-	return true, nil
-}
-
-func (st *store) retainLiveIndexedExportData(path string) (bool, error) {
-	outputID := liveOutputID(path)
-	if outputID == "" {
-		return false, nil
-	}
-	onCopyFallback := func() {
-		if st.verbose {
-			log.Printf("gocachez: hard link unavailable for retained file %s; copying instead", outputID)
-		}
-	}
-	retained, err := retainEscapedIndexedExportDataWithFallback(path, st.retainedPath(outputID, ".i"), onCopyFallback)
-	if err != nil || !retained {
-		return retained, err
-	}
-	if err := st.q.updateRetainedType(context.Background(), outputID, retainedTypeIndexedExportData); err != nil {
-		if st.verbose {
-			log.Printf("gocachez: cache retained file type failed: %v", err)
-		}
-	}
-	return true, nil
-}
-
-func liveOutputID(path string) string {
-	base := filepath.Base(path)
-	outputID, _, ok := strings.Cut(base, "-")
-	if !ok {
-		return ""
-	}
-	return outputID
-}
-
-func (st *store) retainedDir(outputHex string) string {
-	shard := "xx"
-	if len(outputHex) >= 2 {
-		shard = outputHex[:2]
-	}
-	return filepath.Join(retainedRoot(st.versionDir), shard)
-}
-
-func (st *store) retainedPath(outputHex, ext string) string {
-	return filepath.Join(st.retainedDir(outputHex), outputHex+ext)
 }
 
 func (st *store) cleanupAbandonedRuns() error {

@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -27,9 +26,6 @@ type cacheStatus struct {
 	catalog          catalogStatus
 	blobFiles        int64
 	blobTypes        []blobTypeStatus
-	retainedFiles    int64
-	retainedSize     int64
-	retainedTypes    []retainedTypeStatus
 	activeLiveRuns   int64
 	inactiveLiveRuns int64
 }
@@ -42,28 +38,6 @@ type catalogStatus struct {
 	runs              int64
 	oldestAccessedAt  time.Time
 	hasOldestAccessed bool
-}
-
-type retainedTypeKind int
-
-// retainedClassifierVersion identifies the behavior of retainedFileKind. Cached
-// values use this version so classification changes can invalidate them.
-const retainedClassifierVersion = 2
-
-// retainedTypeKind values are persisted in entries.retained_type. Existing
-// values must not be renumbered; append new kinds at the end.
-const (
-	retainedTypeExportArchive retainedTypeKind = iota
-	retainedTypeGeneratedCgoSource
-	retainedTypeGeneratedTestmain
-	retainedTypeOther
-	retainedTypeIndexedExportData
-)
-
-type retainedTypeStatus struct {
-	kind  retainedTypeKind
-	count int64
-	size  int64
 }
 
 func writeStatus(cfg config, w io.Writer) error {
@@ -98,24 +72,18 @@ func writeStatus(cfg config, w io.Writer) error {
 		{"Original output size", formatBytes(status.catalog.size)},
 		{"Compressed cache blobs", formatStorageSize(status.catalog.compressedSize, status.blobFiles)},
 		{"Blob max usage", formatMaxUsage(status.catalog.compressedSize, status.maxSize)},
-		{"Retained go-list files", formatStorageSize(status.retainedSize, status.retainedFiles)},
-		{"Total stored", formatBytes(status.catalog.compressedSize + status.retainedSize)},
 		{"Blob-only savings", formatSavings(status.catalog.size, status.catalog.compressedSize)},
-		{"Overall savings", formatSavings(status.catalog.size, status.catalog.compressedSize+status.retainedSize)},
 	}); err != nil {
 		return err
 	}
 	if err := writeBlobTypeStatus(w, status.blobTypes); err != nil {
 		return err
 	}
-	if err := writeRetainedTypeStatus(w, status.retainedTypes); err != nil {
-		return err
-	}
 	return nil
 }
 
 func readStatus(cfg config) (cacheStatus, error) {
-	versionDir, blobsDir, liveRoot, _ := cachePaths(cfg)
+	versionDir, outputsDir, liveRoot, _ := cachePaths(cfg)
 	status := cacheStatus{
 		cacheDir:   cfg.dir,
 		maxSize:    cfg.maxSize,
@@ -136,14 +104,10 @@ func readStatus(cfg config) (cacheStatus, error) {
 	}
 	status.catalogExists = catalogExists
 	status.catalog = catalog
-	// Blob file count matches the number of cached outputs, so derive it
-	// from the catalog instead of walking the blobs directory.
+	// The stored file count matches the number of cached outputs, so derive it
+	// from the catalog instead of walking the outputs directory.
 	status.blobFiles = status.catalog.outputs
-	status.blobTypes = blobTypeStatuses(dbPath, blobsDir, outputs)
-	status.retainedFiles, status.retainedSize, status.retainedTypes, err = readRetainedStatus(dbPath, retainedRoot(versionDir), outputs)
-	if err != nil {
-		return cacheStatus{}, err
-	}
+	status.blobTypes = blobTypeStatuses(dbPath, outputsDir, outputs)
 	status.activeLiveRuns, status.inactiveLiveRuns, err = readLiveStatus(liveRoot)
 	if err != nil {
 		return cacheStatus{}, err
@@ -191,20 +155,16 @@ func readCatalogStatus(dbPath string) (bool, catalogStatus, []catalogOutput, err
 	}
 
 	q := newCatalog(db)
-	var hasBlobType, hasRetainedType bool
+	var hasBlobType bool
 	err = db.withConn(context.Background(), func(conn *sqlite.Conn) error {
 		var err error
 		hasBlobType, err = entriesHasColumn(conn, "blob_type_version")
-		if err != nil {
-			return err
-		}
-		hasRetainedType, err = entriesHasColumn(conn, "retained_type_version")
 		return err
 	})
 	if err != nil {
 		return false, catalogStatus{}, nil, fmt.Errorf("inspect catalog schema: %w", err)
 	}
-	outputs, err := q.listOutputs(context.Background(), hasBlobType, blobClassifierVersion, hasRetainedType, retainedClassifierVersion)
+	outputs, err := q.listOutputs(context.Background(), hasBlobType, blobClassifierVersion)
 	if err != nil {
 		return false, catalogStatus{}, nil, fmt.Errorf("list catalog outputs: %w", err)
 	}
@@ -261,26 +221,6 @@ func formatAlignedSavings(uncompressed, compressed int64, amountWidth, percentWi
 		percentWidth,
 		formatSavingsPercent(uncompressed, compressed),
 	)
-}
-
-func writeRetainedTypeStatus(w io.Writer, statuses []retainedTypeStatus) error {
-	if len(statuses) == 0 {
-		return writeRightAlignedTable(w, "Retained go-list files", [][]string{
-			{"Type", "Files", "Size"},
-			{"None", "0", formatBytes(0)},
-		})
-	}
-	rows := [][]string{
-		{"Type", "Files", "Size"},
-	}
-	for _, status := range statuses {
-		rows = append(rows, []string{
-			status.kind.label(),
-			formatInt(status.count),
-			formatBytes(status.size),
-		})
-	}
-	return writeRightAlignedTable(w, "Retained go-list files", rows)
 }
 
 func writeTable(w io.Writer, title string, rows [][]string) error {
@@ -427,127 +367,6 @@ func formatAge(age time.Duration) string {
 	}
 }
 
-func readRetainedStatus(dbPath, root string, outputs []catalogOutput) (int64, int64, []retainedTypeStatus, error) {
-	byKind := make(map[retainedTypeKind]*retainedTypeStatus)
-	cached := make(map[string]retainedTypeKind)
-	for _, output := range outputs {
-		if output.retainedType.ok {
-			cached[output.outputID] = retainedTypeKind(output.retainedType.value)
-		}
-	}
-	classified := make(map[string]retainedTypeKind)
-	var files, size int64
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			return nil
-		}
-		info, err := d.Info()
-		if err != nil {
-			return fmt.Errorf("stat retained file: %w", err)
-		}
-		outputID := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-		kind, ok := cached[outputID]
-		if !ok {
-			kind = retainedFileKind(path)
-			// Archive classification follows directly from the extension. Only
-			// source files need an expensive content-based result cached.
-			if filepath.Ext(path) == ".go" {
-				classified[outputID] = kind
-			}
-		}
-		status := byKind[kind]
-		if status == nil {
-			status = &retainedTypeStatus{
-				kind: kind,
-			}
-			byKind[kind] = status
-		}
-		status.count++
-		status.size += info.Size()
-		files++
-		size += info.Size()
-		return nil
-	})
-	if errors.Is(err, os.ErrNotExist) {
-		return 0, 0, nil, nil
-	}
-	if err != nil {
-		return 0, 0, nil, err
-	}
-	if len(classified) > 0 {
-		_ = persistRetainedTypes(dbPath, classified)
-	}
-
-	statuses := make([]retainedTypeStatus, 0, len(byKind))
-	for _, status := range byKind {
-		statuses = append(statuses, *status)
-	}
-	sort.Slice(statuses, func(i, j int) bool {
-		if statuses[i].size != statuses[j].size {
-			return statuses[i].size > statuses[j].size
-		}
-		return statuses[i].kind.label() < statuses[j].kind.label()
-	})
-	return files, size, statuses, nil
-}
-
-func persistRetainedTypes(dbPath string, classified map[string]retainedTypeKind) error {
-	db, err := openWritableExistingDB(dbPath)
-	if err != nil {
-		return err
-	}
-	defer db.Close() //nolint:errcheck
-
-	const batchSize = 1000
-	batch := make(map[string]retainedTypeKind, batchSize)
-	for outputID, kind := range classified {
-		batch[outputID] = kind
-		if len(batch) < batchSize {
-			continue
-		}
-		if err := persistRetainedTypeBatch(db, batch); err != nil {
-			return err
-		}
-		clear(batch)
-	}
-	if len(batch) > 0 {
-		return persistRetainedTypeBatch(db, batch)
-	}
-	return nil
-}
-
-func persistRetainedTypeBatch(db *sqliteDB, classified map[string]retainedTypeKind) error {
-	return db.withTx(context.Background(), func(conn *sqlite.Conn) error {
-		for outputID, kind := range classified {
-			if err := updateRetainedType(conn, outputID, kind); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-}
-
-func retainedFileKind(path string) retainedTypeKind {
-	switch filepath.Ext(path) {
-	case ".a":
-		return retainedTypeExportArchive
-	case ".i":
-		return retainedTypeIndexedExportData
-	case ".go":
-		data, err := readFilePrefix(path)
-		if err != nil {
-			return retainedTypeOther
-		}
-		if kind, ok := retainedGeneratedSourceKind(data); ok {
-			return kind
-		}
-	}
-	return retainedTypeOther
-}
-
 func readLiveStatus(liveRoot string) (int64, int64, error) {
 	entries, err := os.ReadDir(liveRoot)
 	if errors.Is(err, os.ErrNotExist) {
@@ -583,19 +402,4 @@ func readLiveStatus(liveRoot string) (int64, int64, error) {
 		inactive++
 	}
 	return active, inactive, nil
-}
-
-func (kind retainedTypeKind) label() string {
-	switch kind {
-	case retainedTypeExportArchive:
-		return "Export archives"
-	case retainedTypeGeneratedCgoSource:
-		return "Generated cgo sources"
-	case retainedTypeGeneratedTestmain:
-		return "Generated test mains"
-	case retainedTypeIndexedExportData:
-		return "Indexed export data"
-	default:
-		return "Other retained files"
-	}
 }

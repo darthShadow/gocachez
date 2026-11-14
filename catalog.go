@@ -26,9 +26,7 @@ ON CONFLICT(action_id) DO UPDATE SET
 	created_at = excluded.created_at,
 	accessed_at = excluded.accessed_at,
 	blob_type = CASE WHEN entries.output_id = excluded.output_id THEN entries.blob_type END,
-	blob_type_version = CASE WHEN entries.output_id = excluded.output_id THEN entries.blob_type_version END,
-	retained_type = CASE WHEN entries.output_id = excluded.output_id THEN entries.retained_type END,
-	retained_type_version = CASE WHEN entries.output_id = excluded.output_id THEN entries.retained_type_version END`
+	blob_type_version = CASE WHEN entries.output_id = excluded.output_id THEN entries.blob_type_version END`
 
 const touchEntrySQL = `
 UPDATE entries
@@ -52,7 +50,6 @@ type catalogOutput struct {
 	size           int64
 	compressedSize int64
 	blobType       optionalInt64
-	retainedType   optionalInt64
 }
 
 type optionalInt64 struct {
@@ -144,7 +141,11 @@ WHERE run_id = ?`, runID)
 	})
 }
 
-func (c *catalog) upsertEntry(ctx context.Context, ent entry) error {
+// upsertEntry stores ent. When it replaces this action's old output and no
+// other row names that output, the old output is displaced: before the
+// transaction commits, upsertEntry calls displaced with the old output ID. An
+// error from displaced rolls back the upsert and is returned.
+func (c *catalog) upsertEntry(ctx context.Context, ent entry, displaced func(outputID string) error) error {
 	return c.db.withTx(ctx, func(conn *sqlite.Conn) error {
 		var oldOutputID string
 		oldFound, err := queryPrepared(conn, `
@@ -160,8 +161,20 @@ WHERE action_id = ?`, func(stmt *sqlite.Stmt) {
 		}
 
 		outputIDs := []string{ent.OutputID}
+		displacedOutputID := ""
 		if oldFound && oldOutputID != ent.OutputID {
 			outputIDs = append(outputIDs, oldOutputID)
+			// Count rows rather than summing sizes: an empty output has size 0.
+			others, err := queryInt64(conn, `
+SELECT COUNT(*)
+FROM entries
+WHERE output_id = ? AND action_id != ?`, []any{oldOutputID, ent.ActionID})
+			if err != nil {
+				return err
+			}
+			if others == 0 {
+				displacedOutputID = oldOutputID
+			}
 		}
 		before, err := outputSizeSum(conn, outputIDs)
 		if err != nil {
@@ -183,7 +196,13 @@ WHERE action_id = ?`, func(stmt *sqlite.Stmt) {
 		if err != nil {
 			return err
 		}
-		return adjustState(conn, compressedSizeStateKey, after-before)
+		if err := adjustState(conn, compressedSizeStateKey, after-before); err != nil {
+			return err
+		}
+		if displacedOutputID != "" && displaced != nil {
+			return displaced(displacedOutputID)
+		}
+		return nil
 	})
 }
 
@@ -293,18 +312,12 @@ func (c *catalog) listOutputs(
 	ctx context.Context,
 	includeBlobType bool,
 	blobClassifierVersion int64,
-	includeRetainedType bool,
-	retainedClassifierVersion int64,
 ) ([]catalogOutput, error) {
 	columns := "output_id, CAST(MAX(size) AS INTEGER), CAST(MAX(compressed_size) AS INTEGER)"
 	args := []any(nil)
 	if includeBlobType {
 		columns += ", MAX(CASE WHEN blob_type_version = ? THEN blob_type END)"
 		args = append(args, blobClassifierVersion)
-	}
-	if includeRetainedType {
-		columns += ", MAX(CASE WHEN retained_type_version = ? THEN retained_type END)"
-		args = append(args, retainedClassifierVersion)
 	}
 	var outputs []catalogOutput
 	err := c.useConn(ctx, func(conn *sqlite.Conn) error {
@@ -316,15 +329,8 @@ func (c *catalog) listOutputs(
 					size:           stmt.ColumnInt64(1),
 					compressedSize: stmt.ColumnInt64(2),
 				}
-				column := 3
-				if includeBlobType {
-					if !stmt.ColumnIsNull(column) {
-						output.blobType = optionalInt64{value: stmt.ColumnInt64(column), ok: true}
-					}
-					column++
-				}
-				if includeRetainedType && !stmt.ColumnIsNull(column) {
-					output.retainedType = optionalInt64{value: stmt.ColumnInt64(column), ok: true}
+				if includeBlobType && !stmt.ColumnIsNull(3) {
+					output.blobType = optionalInt64{value: stmt.ColumnInt64(3), ok: true}
 				}
 				outputs = append(outputs, output)
 				return nil
@@ -363,21 +369,6 @@ SET blob_type = ?, blob_type_version = ?
 WHERE output_id = ?`, int64(kind), classifierVersion, outputID)
 }
 
-func (c *catalog) updateRetainedType(ctx context.Context, outputID string, kind retainedTypeKind) error {
-	return c.useConn(ctx, func(conn *sqlite.Conn) error {
-		return updateRetainedType(conn, outputID, kind)
-	})
-}
-
-func updateRetainedType(conn *sqlite.Conn, outputID string, kind retainedTypeKind) error {
-	return execute(conn, `
-UPDATE entries
-SET retained_type = ?, retained_type_version = ?
-WHERE output_id = ?
-	AND (retained_type IS NOT ? OR retained_type_version IS NOT ?)`,
-		int64(kind), retainedClassifierVersion, outputID, int64(kind), retainedClassifierVersion)
-}
-
 func entriesHasColumn(conn *sqlite.Conn, column string) (bool, error) {
 	found := false
 	err := sqlitex.Execute(conn, `SELECT name FROM pragma_table_info('entries')`, &sqlitex.ExecOptions{
@@ -391,14 +382,19 @@ func entriesHasColumn(conn *sqlite.Conn, column string) (bool, error) {
 	return found, err
 }
 
-func (c *catalog) pruneCandidates(ctx context.Context) ([]pruneCandidate, error) {
+// pruneCandidates returns the outputs whose last use is before floorCutoff
+// (Unix milliseconds), oldest first. Outputs used since then are never
+// candidates.
+func (c *catalog) pruneCandidates(ctx context.Context, floorCutoff int64) ([]pruneCandidate, error) {
 	var candidates []pruneCandidate
 	err := c.useConn(ctx, func(conn *sqlite.Conn) error {
 		return sqlitex.Execute(conn, `
 SELECT e.output_id, CAST(MAX(e.compressed_size) AS INTEGER)
 FROM entries AS e
 GROUP BY e.output_id
+HAVING MAX(e.accessed_at) < ?
 ORDER BY MAX(e.accessed_at)`, &sqlitex.ExecOptions{
+			Args: []any{floorCutoff},
 			ResultFunc: func(stmt *sqlite.Stmt) error {
 				candidates = append(candidates, pruneCandidate{
 					outputID: stmt.ColumnText(0),

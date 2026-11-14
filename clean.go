@@ -11,7 +11,7 @@ import (
 )
 
 func cleanCache(cfg config) error {
-	versionDir, blobsDir, liveRoot, lifecycleLockPath := cachePaths(cfg)
+	versionDir, outputsDir, liveRoot, lifecycleLockPath := cachePaths(cfg)
 	if _, err := os.Stat(versionDir); errors.Is(err, os.ErrNotExist) {
 		return nil
 	} else if err != nil {
@@ -21,7 +21,7 @@ func cleanCache(cfg config) error {
 	st := &store{
 		config:            cfg,
 		versionDir:        versionDir,
-		blobsDir:          blobsDir,
+		outputsDir:        outputsDir,
 		liveRoot:          liveRoot,
 		lifecycleLockPath: lifecycleLockPath,
 	}
@@ -53,10 +53,6 @@ func (st *store) cleanLocked() error {
 	}
 	activeRuns := int64(0)
 	if st.q != nil {
-		if err := st.removeOrphanOutputFiles(false); err != nil {
-			_ = st.db.Close()
-			return err
-		}
 		activeRuns, err = st.q.countRuns(context.Background())
 		if err != nil {
 			_ = st.db.Close()
@@ -78,14 +74,11 @@ func (st *store) cleanLocked() error {
 		}
 		st.db = nil
 	}
-	if err := os.RemoveAll(st.blobsDir); err != nil {
-		return fmt.Errorf("remove blobs dir: %w", err)
+	if err := os.RemoveAll(st.outputsDir); err != nil {
+		return fmt.Errorf("remove outputs dir: %w", err)
 	}
 	if err := os.RemoveAll(st.liveRoot); err != nil {
 		return fmt.Errorf("remove live dir: %w", err)
-	}
-	if err := os.RemoveAll(retainedRoot(st.versionDir)); err != nil {
-		return fmt.Errorf("remove retained dir: %w", err)
 	}
 	for _, path := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {

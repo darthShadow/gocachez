@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/gofrs/flock"
+	"golang.org/x/sys/unix"
 	"golang.org/x/tools/go/gcexportdata"
 	"zombiezen.com/go/sqlite"
 	"zombiezen.com/go/sqlite/sqlitex"
@@ -201,8 +202,9 @@ func TestStorePutGet(t *testing.T) {
 	if !filepath.IsAbs(res.DiskPath) {
 		t.Fatalf("put DiskPath is not absolute: %q", res.DiskPath)
 	}
-	if rel, err := filepath.Rel(st.liveRoot, res.DiskPath); err != nil || rel == "." || rel == ".." || filepath.IsAbs(rel) || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		t.Fatalf("put DiskPath = %q, not under live root %q", res.DiskPath, st.liveRoot)
+	outputsDir := filepath.Join(st.versionDir, "outputs")
+	if rel, err := filepath.Rel(outputsDir, res.DiskPath); err != nil || rel == "." || rel == ".." || filepath.IsAbs(rel) || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		t.Fatalf("put DiskPath = %q, not under outputs dir %q", res.DiskPath, outputsDir)
 	}
 	gotBody, err := os.ReadFile(res.DiskPath)
 	if err != nil {
@@ -255,122 +257,6 @@ func TestGetMiss(t *testing.T) {
 	}
 }
 
-func TestGetMaterializesAfterLiveFileRemoved(t *testing.T) {
-	t.Parallel()
-
-	st, err := newStore(config{
-		dir: t.TempDir(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.close()
-
-	actionID := bytes.Repeat([]byte{34}, 32)
-	body := []byte("materialize this")
-	outputID := sha256Sum(body)
-	putRes, err := st.put(request{
-		ID:       1,
-		Command:  cmdPut,
-		ActionID: actionID,
-		OutputID: outputID,
-		BodySize: int64(len(body)),
-	}, bufio.NewReader(encodedBody(body)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(putRes.DiskPath); err != nil {
-		t.Fatal(err)
-	}
-
-	getRes, err := st.get(request{ID: 2, Command: cmdGet, ActionID: actionID})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if getRes.Miss || getRes.DiskPath == putRes.DiskPath {
-		t.Fatalf("get response = %+v, put path %q", getRes, putRes.DiskPath)
-	}
-	got, err := os.ReadFile(getRes.DiskPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, body) {
-		t.Fatalf("materialized body = %q, want %q", got, body)
-	}
-}
-
-func TestConcurrentGetsMaterializeOnce(t *testing.T) {
-	t.Parallel()
-
-	st, err := newStore(config{dir: t.TempDir()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.close()
-
-	body := bytes.Repeat([]byte("shared artifact\n"), 1<<20)
-	actionID := sha256Sum([]byte("shared action"))
-	res, err := st.put(request{
-		ID:       1,
-		Command:  cmdPut,
-		ActionID: actionID,
-		OutputID: sha256Sum(body),
-		BodySize: int64(len(body)),
-	}, bufio.NewReader(encodedBody(body)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(res.DiskPath); err != nil {
-		t.Fatal(err)
-	}
-
-	const workers = 8
-	type result struct {
-		res response
-		err error
-	}
-	results := make(chan result, workers)
-	start := make(chan struct{})
-	for i := range workers {
-		go func() {
-			<-start
-			res, err := st.get(request{ID: int64(i + 2), Command: cmdGet, ActionID: actionID})
-			results <- result{res, err}
-		}()
-	}
-	close(start)
-	paths := make(map[string]struct{})
-	for range workers {
-		got := <-results
-		if got.err != nil {
-			t.Fatal(got.err)
-		}
-		if got.res.Miss {
-			t.Fatal("concurrent get missed")
-		}
-		paths[got.res.DiskPath] = struct{}{}
-	}
-	if len(paths) != 1 {
-		t.Fatalf("concurrent gets created %d materializations, want 1", len(paths))
-	}
-	files, err := os.ReadDir(st.runDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(files) != 2 {
-		t.Fatalf("live run contains %d files, want one artifact and run.lock", len(files))
-	}
-	for path := range paths {
-		got, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Equal(got, body) {
-			t.Fatal("materialized body differs from cached artifact")
-		}
-	}
-}
-
 func TestGetRejectsInvalidCatalogOutputID(t *testing.T) {
 	t.Parallel()
 
@@ -384,10 +270,6 @@ func TestGetRejectsInvalidCatalogOutputID(t *testing.T) {
 
 	actionID := hexOf(bytes.Repeat([]byte{36}, 32))
 	outputID := "not-hex"
-	path := filepath.Join(st.runDir, "body")
-	if err := os.WriteFile(path, []byte("body"), 0o666); err != nil {
-		t.Fatal(err)
-	}
 	if err := st.upsertEntry(entry{
 		ActionID:       actionID,
 		OutputID:       outputID,
@@ -398,50 +280,9 @@ func TestGetRejectsInvalidCatalogOutputID(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	st.setMaterialized(outputID, path)
 
-	if _, err := st.get(request{ID: 1, Command: cmdGet, ActionID: bytes.Repeat([]byte{36}, 32)}); err == nil {
-		t.Fatal("get accepted invalid catalog output ID")
-	}
-}
-
-func TestInvalidMaterializedBlobIsCacheMiss(t *testing.T) {
-	t.Parallel()
-
-	st, err := newStore(config{
-		dir: t.TempDir(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.close()
-
-	actionID := bytes.Repeat([]byte{38}, 32)
-	body := []byte("body")
-	outputHex := hexOf(sha256Sum(body))
-	if err := os.MkdirAll(st.blobDir(outputHex), 0o777); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeCompressedFile(st, st.blobPath(outputHex), body); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.upsertEntry(entry{
-		ActionID:       hexOf(actionID),
-		OutputID:       outputHex,
-		Size:           int64(len(body)) + 1,
-		CompressedSize: int64(len(body)),
-		CreatedAt:      time.Now(),
-		AccessedAt:     time.Now(),
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	res, err := st.get(request{ID: 1, Command: cmdGet, ActionID: actionID})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !res.Miss {
-		t.Fatalf("get response = %+v, want miss", res)
+	if res, err := st.get(request{ID: 1, Command: cmdGet, ActionID: bytes.Repeat([]byte{36}, 32)}); err == nil {
+		t.Fatalf("get accepted invalid catalog output ID: %+v", res)
 	}
 }
 
@@ -459,25 +300,17 @@ func TestOutputIDIsOpaque(t *testing.T) {
 	actionID := bytes.Repeat([]byte{39}, 32)
 	outputID := bytes.Repeat([]byte{40}, 32)
 	body := []byte("body")
-	outputHex := hexOf(outputID)
-	if err := os.MkdirAll(st.blobDir(outputHex), 0o777); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeCompressedFile(st, st.blobPath(outputHex), body); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.upsertEntry(entry{
-		ActionID:       hexOf(actionID),
-		OutputID:       outputHex,
-		Size:           int64(len(body)),
-		CompressedSize: int64(len(body)),
-		CreatedAt:      time.Now(),
-		AccessedAt:     time.Now(),
-	}); err != nil {
+	if _, err := st.put(request{
+		ID:       1,
+		Command:  cmdPut,
+		ActionID: actionID,
+		OutputID: outputID,
+		BodySize: int64(len(body)),
+	}, bufio.NewReader(encodedBody(body))); err != nil {
 		t.Fatal(err)
 	}
 
-	res, err := st.get(request{ID: 1, Command: cmdGet, ActionID: actionID})
+	res, err := st.get(request{ID: 2, Command: cmdGet, ActionID: actionID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -516,15 +349,24 @@ func TestPutAcceptsZeroSizeBody(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.DiskPath == "" {
-		t.Fatalf("put response = %+v", res)
+	want := filepath.Join(st.versionDir, "outputs", hexOf(outputID)[:2], hexOf(outputID))
+	if res.DiskPath != want {
+		t.Fatalf("put DiskPath = %q, want %q", res.DiskPath, want)
+	}
+	var info unix.Stat_t
+	if err := unix.Lstat(res.DiskPath, &info); err != nil {
+		t.Fatal(err)
+	}
+	if info.Size != 0 || info.Blocks != 0 || info.Flags&unix.UF_COMPRESSED != 0 || info.Mode&0o777 != 0o444 {
+		t.Fatalf("empty stored file: size=%d blocks=%d flags=%#x mode=%#o, want an empty plain file with mode 0444",
+			info.Size, info.Blocks, info.Flags, info.Mode&0o777)
 	}
 	getRes, err := st.get(request{ID: 2, Command: cmdGet, ActionID: actionID})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if getRes.Miss || getRes.Size != 0 {
-		t.Fatalf("get response = %+v", getRes)
+	if getRes.Miss || getRes.Size != 0 || getRes.DiskPath != want {
+		t.Fatalf("get response = %+v, want a hit at %q with size 0", getRes, want)
 	}
 }
 
@@ -539,7 +381,6 @@ func TestPutReusesExistingBlobAndRecoversFromEviction(t *testing.T) {
 
 	body := bytes.Repeat([]byte("duplicate output"), 1024)
 	outputID := sha256Sum(body)
-	outputHex := hexOf(outputID)
 	original, err := st.put(request{
 		ID:       1,
 		Command:  cmdPut,
@@ -550,14 +391,11 @@ func TestPutReusesExistingBlobAndRecoversFromEviction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	originalBlob, err := os.ReadFile(st.blobPath(outputHex))
-	if err != nil {
-		t.Fatal(err)
-	}
 
+	// The stored file disappears while the next put reads its body.
 	removeReader := &removeFileReader{
 		reader: encodedBody(body),
-		path:   st.blobPath(outputHex),
+		path:   original.DiskPath,
 	}
 	reused, err := st.put(request{
 		ID:       2,
@@ -572,35 +410,40 @@ func TestPutReusesExistingBlobAndRecoversFromEviction(t *testing.T) {
 	if reused.DiskPath != original.DiskPath {
 		t.Fatalf("recovered put path = %q, want %q", reused.DiskPath, original.DiskPath)
 	}
-	recreatedBlob, err := os.ReadFile(st.blobPath(outputHex))
-	if err != nil {
-		t.Fatal(err)
+	if !removeReader.removed {
+		t.Fatal("put did not read the body: nothing was removed during the put")
 	}
-	if !bytes.Equal(recreatedBlob, originalBlob) {
-		t.Fatal("recreated blob differs from original compressed content")
+	// The put saw the file, wrote nothing, and the file is gone: the next put
+	// must restore it from its own body.
+	if _, err := os.Stat(original.DiskPath); !os.IsNotExist(err) {
+		t.Fatalf("stored file stat err = %v, want not exist after removal during put", err)
 	}
-	if err := os.Remove(st.blobPath(outputHex)); err != nil {
-		t.Fatal(err)
-	}
-	reused, err = st.put(request{
-		ID:       3,
-		Command:  cmdPut,
-		ActionID: bytes.Repeat([]byte{43}, 32),
-		OutputID: outputID,
-		BodySize: int64(len(body)),
-	}, bufio.NewReader(encodedBody(body)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if reused.DiskPath != original.DiskPath {
-		t.Fatalf("put with missing blob path = %q, want %q", reused.DiskPath, original.DiskPath)
-	}
-	recreatedBlob, err = os.ReadFile(st.blobPath(outputHex))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(recreatedBlob, originalBlob) {
-		t.Fatal("blob recreated from the put body differs from original")
+	for i, id := range []byte{43, 44} {
+		reused, err = st.put(request{
+			ID:       int64(3 + i),
+			Command:  cmdPut,
+			ActionID: bytes.Repeat([]byte{id}, 32),
+			OutputID: outputID,
+			BodySize: int64(len(body)),
+		}, bufio.NewReader(encodedBody(body)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reused.DiskPath != original.DiskPath {
+			t.Fatalf("put with missing stored file path = %q, want %q", reused.DiskPath, original.DiskPath)
+		}
+		got, err := os.ReadFile(original.DiskPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, body) {
+			t.Fatal("stored file recreated from the put body differs from the original")
+		}
+		if i == 0 {
+			if err := os.Remove(original.DiskPath); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 }
 
@@ -630,7 +473,10 @@ func TestPutRecreatesStaleMaterializedOutput(t *testing.T) {
 			if missing {
 				err = os.Remove(original.DiskPath)
 			} else {
-				err = os.Truncate(original.DiskPath, 0)
+				// A tool made the file writable and truncated it.
+				if err = os.Chmod(original.DiskPath, 0o644); err == nil {
+					err = os.Truncate(original.DiskPath, 0)
+				}
 			}
 			if err != nil {
 				t.Fatal(err)
@@ -641,15 +487,15 @@ func TestPutRecreatesStaleMaterializedOutput(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if res.DiskPath == original.DiskPath {
-				t.Fatal("put reused a missing or wrong-sized live file")
+			if res.DiskPath != original.DiskPath {
+				t.Fatalf("put path = %q, want the same stored path %q", res.DiskPath, original.DiskPath)
 			}
 			got, err := os.ReadFile(res.DiskPath)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if !bytes.Equal(got, body) {
-				t.Fatal("replacement live file differs from put body")
+				t.Fatal("restored stored file differs from put body")
 			}
 		})
 	}
@@ -697,14 +543,14 @@ func TestPutReusesMaterializedOutput(t *testing.T) {
 				}
 			}
 			if len(paths) != 1 {
-				t.Fatalf("shared output puts created %d live files, want 1", len(paths))
+				t.Fatalf("shared output puts created %d stored files, want 1", len(paths))
 			}
 			files, err := os.ReadDir(st.runDir)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(files) != 2 {
-				t.Fatalf("live run contains %d files, want one artifact and run.lock", len(files))
+			if len(files) != 1 || files[0].Name() != "run.lock" {
+				t.Fatalf("run folder holds %v, want only run.lock", files)
 			}
 			for path := range paths {
 				got, err := os.ReadFile(path)
@@ -712,7 +558,7 @@ func TestPutReusesMaterializedOutput(t *testing.T) {
 					t.Fatal(err)
 				}
 				if !bytes.Equal(got, body) {
-					t.Fatal("reused live file differs from the put body")
+					t.Fatal("stored file differs from the put body")
 				}
 			}
 		})
@@ -722,9 +568,9 @@ func TestPutReusesMaterializedOutput(t *testing.T) {
 func TestPutRejectsInvalidBody(t *testing.T) {
 	t.Parallel()
 
-	for _, size := range []int{4, putWriteBufferSize + 17} {
+	for _, size := range []int{4, 64<<10 + 17} {
 		body := bytes.Repeat([]byte("x"), size)
-		for _, mode := range []string{"reused-live", "existing-blob", "new-blob"} {
+		for _, mode := range []string{"existing-file", "no-file"} {
 			for _, tt := range []struct {
 				name  string
 				input string
@@ -751,14 +597,8 @@ func TestPutRejectsInvalidBody(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					if mode != "reused-live" {
-						st.deleteMaterialized(hexOf(req.OutputID))
+					if mode == "no-file" {
 						if err := os.Remove(original.DiskPath); err != nil {
-							t.Fatal(err)
-						}
-					}
-					if mode == "new-blob" {
-						if err := os.Remove(st.blobPath(hexOf(req.OutputID))); err != nil {
 							t.Fatal(err)
 						}
 					}
@@ -772,22 +612,32 @@ func TestPutRejectsInvalidBody(t *testing.T) {
 					if err != nil || next.ID != 99 {
 						t.Fatalf("invalid body was not drained: next=%+v, err=%v", next, err)
 					}
-					if mode == "reused-live" {
+					if mode == "existing-file" {
 						got, err := os.ReadFile(original.DiskPath)
 						if err != nil {
 							t.Fatal(err)
 						}
 						if !bytes.Equal(got, body) {
-							t.Fatal("invalid put changed the existing live file")
+							t.Fatal("invalid put changed the existing stored file")
 						}
-					} else {
-						files, err := os.ReadDir(st.runDir)
-						if err != nil {
-							t.Fatal(err)
+					} else if _, err := os.Stat(original.DiskPath); !os.IsNotExist(err) {
+						t.Fatalf("invalid put left a stored file: stat err = %v", err)
+					}
+					shard, err := os.ReadDir(filepath.Dir(original.DiskPath))
+					if err != nil {
+						t.Fatal(err)
+					}
+					for _, file := range shard {
+						if strings.Contains(file.Name(), tempMarker) {
+							t.Fatalf("invalid put left a temp file: %s", file.Name())
 						}
-						if len(files) != 1 || files[0].Name() != "run.lock" {
-							t.Fatalf("invalid put left live files: %v", files)
-						}
+					}
+					files, err := os.ReadDir(st.runDir)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if len(files) != 1 || files[0].Name() != "run.lock" {
+						t.Fatalf("invalid put left run folder files: %v", files)
 					}
 					if _, found, err := st.lookupEntry(hexOf(req.ActionID)); err != nil || found {
 						t.Fatalf("invalid put registered an action: found=%t, err=%v", found, err)
@@ -833,192 +683,6 @@ func BenchmarkPutSharedOutput(b *testing.B) {
 				}
 			}
 		})
-	}
-}
-
-func BenchmarkPutFreshLiveFile(b *testing.B) {
-	for _, size := range []int{0, 1024, 1 << 20} {
-		for _, blobExists := range []bool{true, false} {
-			b.Run(fmt.Sprintf("bytes=%d/blob-exists=%t", size, blobExists), func(b *testing.B) {
-				st, err := newStore(config{dir: b.TempDir()})
-				if err != nil {
-					b.Fatal(err)
-				}
-				b.Cleanup(st.close)
-				body := bytes.Repeat([]byte("x"), size)
-				var input []byte
-				if size != 0 {
-					input, err = io.ReadAll(encodedBody(body))
-					if err != nil {
-						b.Fatal(err)
-					}
-				}
-				req := request{
-					ID:       1,
-					Command:  cmdPut,
-					ActionID: sha256Sum([]byte("action")),
-					OutputID: sha256Sum(body),
-					BodySize: int64(size),
-				}
-				res, err := st.put(req, bufio.NewReader(bytes.NewReader(input)))
-				if err != nil {
-					b.Fatal(err)
-				}
-				outputHex := hexOf(req.OutputID)
-				b.ReportAllocs()
-				b.SetBytes(int64(size))
-				b.ResetTimer()
-				for range b.N {
-					st.deleteMaterialized(outputHex)
-					if err := os.Remove(res.DiskPath); err != nil {
-						b.Fatal(err)
-					}
-					if !blobExists {
-						if err := os.Remove(st.blobPath(outputHex)); err != nil {
-							b.Fatal(err)
-						}
-					}
-					res, err = st.put(req, bufio.NewReader(bytes.NewReader(input)))
-					if err != nil {
-						b.Fatal(err)
-					}
-				}
-			})
-		}
-	}
-}
-
-func TestPutBodyWriterBuffersChunks(t *testing.T) {
-	t.Parallel()
-
-	for _, size := range []int{0, 1, putWriteBufferSize - 1, putWriteBufferSize, putWriteBufferSize + 1, 1<<20 + 17} {
-		for _, multiWriter := range []bool{false, true} {
-			t.Run(fmt.Sprintf("bytes=%d/multiwriter=%t", size, multiWriter), func(t *testing.T) {
-				t.Parallel()
-				st := new(store)
-				body := bytes.Repeat([]byte("x"), size)
-				for range 2 {
-					dst := new(recordingBodyWriter)
-					bw := st.getBodyWriter(dst)
-					var writer io.Writer = bw
-					if multiWriter {
-						writer = io.MultiWriter(bw, io.Discard)
-					}
-					br := bufio.NewReader(encodedBody(body))
-					src, err := bodyReader(br, int64(size))
-					if err != nil {
-						t.Fatal(err)
-					}
-					written, err := io.Copy(writer, src)
-					if err != nil {
-						t.Fatal(err)
-					}
-					if err := bw.Flush(); err != nil {
-						t.Fatal(err)
-					}
-					st.putBodyWriter(bw)
-					if written != int64(size) || !bytes.Equal(dst.Bytes(), body) {
-						t.Fatalf("buffered body differs: written=%d, want %d", written, size)
-					}
-					if dst.readFromCalled {
-						t.Fatal("buffered writer delegated to the destination's ReadFrom")
-					}
-					wantWrites := (size + putWriteBufferSize - 1) / putWriteBufferSize
-					if len(dst.writeSizes) != wantWrites {
-						t.Fatalf("body used %d writes, want %d", len(dst.writeSizes), wantWrites)
-					}
-				}
-			})
-		}
-	}
-}
-
-func TestPutBodyWriterResetsAfterError(t *testing.T) {
-	t.Parallel()
-
-	st := new(store)
-	bw := st.getBodyWriter(errWriter{})
-	if _, err := bw.WriteString("discarded"); err != nil {
-		t.Fatal(err)
-	}
-	if err := bw.Flush(); err == nil {
-		t.Fatal("flush succeeded with a failing destination")
-	}
-	st.putBodyWriter(bw)
-
-	var dst bytes.Buffer
-	bw = st.getBodyWriter(&dst)
-	defer st.putBodyWriter(bw)
-	if _, err := bw.WriteString("replacement"); err != nil {
-		t.Fatal(err)
-	}
-	if err := bw.Flush(); err != nil {
-		t.Fatal(err)
-	}
-	if dst.String() != "replacement" {
-		t.Fatalf("reused buffered writer produced %q, want replacement", dst.String())
-	}
-}
-
-func TestPutFlushesBufferedBody(t *testing.T) {
-	t.Parallel()
-
-	for _, size := range []int{1, putWriteBufferSize - 1, putWriteBufferSize, putWriteBufferSize + 1} {
-		for _, blobExists := range []bool{false, true} {
-			t.Run(fmt.Sprintf("bytes=%d/blob-exists=%t", size, blobExists), func(t *testing.T) {
-				t.Parallel()
-				st, err := newStore(config{dir: t.TempDir()})
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer st.close()
-				body := bytes.Repeat([]byte("x"), size)
-				req := request{
-					ID:       1,
-					Command:  cmdPut,
-					ActionID: sha256Sum([]byte("action")),
-					OutputID: sha256Sum(body),
-					BodySize: int64(size),
-				}
-				outputHex := hexOf(req.OutputID)
-				if blobExists {
-					res, err := st.put(req, bufio.NewReader(encodedBody(body)))
-					if err != nil {
-						t.Fatal(err)
-					}
-					st.deleteMaterialized(outputHex)
-					if err := os.Remove(res.DiskPath); err != nil {
-						t.Fatal(err)
-					}
-				}
-				res, err := st.put(req, bufio.NewReader(encodedBody(body)))
-				if err != nil {
-					t.Fatal(err)
-				}
-				got, err := os.ReadFile(res.DiskPath)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if !bytes.Equal(got, body) {
-					t.Fatal("put published an incompletely flushed live file")
-				}
-				st.deleteMaterialized(outputHex)
-				if err := os.Remove(res.DiskPath); err != nil {
-					t.Fatal(err)
-				}
-				res, err = st.get(request{ID: 2, Command: cmdGet, ActionID: req.ActionID})
-				if err != nil || res.Miss {
-					t.Fatalf("get after buffered put = %+v, err=%v", res, err)
-				}
-				got, err = os.ReadFile(res.DiskPath)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if !bytes.Equal(got, body) {
-					t.Fatal("compressed blob differs from the buffered put body")
-				}
-			})
-		}
 	}
 }
 
@@ -1081,7 +745,7 @@ func TestPutDrainsBodyOnSetupError(t *testing.T) {
 	if err := os.WriteFile(notDir, nil, 0o666); err != nil {
 		t.Fatal(err)
 	}
-	st.blobsDir = notDir
+	st.outputsDir = notDir
 
 	var input bytes.Buffer
 	input.Write(encodedBody([]byte("body")).Bytes())
@@ -1096,7 +760,7 @@ func TestPutDrainsBodyOnSetupError(t *testing.T) {
 		BodySize: 4,
 	}, br)
 	if err == nil {
-		t.Fatal("put succeeded with invalid blobs dir")
+		t.Fatal("put succeeded with invalid outputs dir")
 	}
 
 	req, err := readRequest(br)
@@ -1106,58 +770,6 @@ func TestPutDrainsBodyOnSetupError(t *testing.T) {
 	if req.ID != 2 || req.Command != cmdClose {
 		t.Fatalf("next request = %+v, want close request", req)
 	}
-}
-
-func TestEncoderAndDecoderPools(t *testing.T) {
-	t.Parallel()
-
-	st, err := newStore(config{
-		dir: t.TempDir(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.close()
-
-	for _, body := range [][]byte{
-		[]byte("body"),
-		bytes.Repeat([]byte("pooled artifact\n"), 2<<20),
-		[]byte("again"),
-	} {
-		var compressed bytes.Buffer
-		enc, err := st.getEncoder(&compressed)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := enc.Write(body); err != nil {
-			t.Fatal(err)
-		}
-		if err := enc.Close(); err != nil {
-			t.Fatal(err)
-		}
-		st.putEncoder(enc)
-
-		dec, err := st.getDecoder(bytes.NewReader(compressed.Bytes()))
-		if err != nil {
-			t.Fatal(err)
-		}
-		got, err := io.ReadAll(dec)
-		st.putDecoder(dec)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Equal(got, body) {
-			t.Fatalf("pooled decoder changed body: got %d bytes, want %d", len(got), len(body))
-		}
-	}
-	dec, err := st.getDecoder(strings.NewReader("not zstd"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := io.ReadAll(dec); err == nil {
-		t.Fatal("pooled decoder accepted invalid zstd")
-	}
-	dec.Close()
 }
 
 func TestVersionedLayout(t *testing.T) {
@@ -1172,12 +784,12 @@ func TestVersionedLayout(t *testing.T) {
 	}
 	defer st.close()
 
-	wantVersionDir := filepath.Join(cacheDir, "v1")
+	wantVersionDir := filepath.Join(cacheDir, "v2")
 	if st.versionDir != wantVersionDir {
 		t.Fatalf("versionDir = %q, want %q", st.versionDir, wantVersionDir)
 	}
-	if st.blobsDir != filepath.Join(wantVersionDir, "blobs") {
-		t.Fatalf("blobsDir = %q, want under version dir", st.blobsDir)
+	if st.outputsDir != filepath.Join(wantVersionDir, "outputs") {
+		t.Fatalf("outputsDir = %q, want under version dir", st.outputsDir)
 	}
 	if st.liveRoot != filepath.Join(wantVersionDir, "live") {
 		t.Fatalf("liveRoot = %q, want under version dir", st.liveRoot)
@@ -1323,7 +935,7 @@ func TestReclaimsAbandonedUnlockedRun(t *testing.T) {
 	}
 	runID := st.runID
 	runDir := st.runDir
-	livePath := res.DiskPath
+	storedPath := res.DiskPath
 	abandonStore(t, st)
 
 	st, err = newStore(config{
@@ -1337,8 +949,8 @@ func TestReclaimsAbandonedUnlockedRun(t *testing.T) {
 	if _, err := os.Stat(runDir); !os.IsNotExist(err) {
 		t.Fatalf("abandoned run dir still exists: err=%v", err)
 	}
-	if _, err := os.Stat(livePath); !os.IsNotExist(err) {
-		t.Fatalf("abandoned live file still exists: err=%v", err)
+	if _, err := os.Stat(storedPath); err != nil {
+		t.Fatalf("stored file of the abandoned run was removed: %v", err)
 	}
 	if got := countRows(t, st.db, `SELECT COUNT(*) FROM runs WHERE run_id = ?`, runID); got != 0 {
 		t.Fatalf("abandoned run rows = %d, want 0", got)
@@ -1438,91 +1050,8 @@ func TestCloseDropsLiveFiles(t *testing.T) {
 	if _, err := os.Stat(runDir); !os.IsNotExist(err) {
 		t.Fatalf("live run dir still exists: err=%v", err)
 	}
-}
-
-func TestCloseStripsPackageArchiveLiveFile(t *testing.T) {
-	t.Parallel()
-
-	cacheDir := t.TempDir()
-	st, err := newStore(config{
-		dir: cacheDir,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	exportData := []byte("uFAKE")
-	pkgdef := goPkgdef(exportData)
-	body := goArchive(pkgdef, bytes.Repeat([]byte("object data"), 1024))
-	actionID := bytes.Repeat([]byte{53}, 32)
-	outputID := bytes.Repeat([]byte{54}, 32)
-	res, err := st.put(request{
-		ID:       1,
-		Command:  cmdPut,
-		ActionID: actionID,
-		OutputID: outputID,
-		BodySize: int64(len(body)),
-	}, bufio.NewReader(encodedBody(body)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	st.close()
-
-	info, err := os.Stat(res.DiskPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Size() >= int64(len(body)) {
-		t.Fatalf("stripped live archive size = %d, want < %d", info.Size(), len(body))
-	}
-	if got := readExportData(t, res.DiskPath); !bytes.Equal(got, exportData) {
-		t.Fatalf("export data = %q, want %q", got, exportData)
-	}
-	if _, err := os.Stat(st.runDir); err != nil {
-		t.Fatalf("run dir with stripped export archive was removed: %v", err)
-	}
-	if got := readExportData(t, retainedPath(cacheDir, outputID, ".a")); !bytes.Equal(got, exportData) {
-		t.Fatalf("retained export data = %q, want %q", got, exportData)
-	}
-}
-
-func TestCloseRetainsIndexedExportData(t *testing.T) {
-	t.Parallel()
-
-	cacheDir := t.TempDir()
-	st, err := newStore(config{
-		dir: cacheDir,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	body := indexedExportData(t)
-	actionID := bytes.Repeat([]byte{55}, 32)
-	outputID := bytes.Repeat([]byte{56}, 32)
-	res, err := st.put(request{
-		ID:       1,
-		Command:  cmdPut,
-		ActionID: actionID,
-		OutputID: outputID,
-		BodySize: int64(len(body)),
-	}, bufio.NewReader(encodedBody(body)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	st.close()
-
-	for _, path := range []string{res.DiskPath, retainedPath(cacheDir, outputID, ".i")} {
-		got, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Equal(got, body) {
-			t.Fatalf("retained indexed export data = %x, want %x", got, body)
-		}
-	}
-	if _, err := os.Stat(st.runDir); err != nil {
-		t.Fatalf("run dir with indexed export data was removed: %v", err)
+	if _, err := os.Stat(res.DiskPath); err != nil {
+		t.Fatalf("stored file was removed at close: %v", err)
 	}
 }
 
@@ -1542,518 +1071,6 @@ func TestIndexedExportDataDetectionRejectsText(t *testing.T) {
 	}
 }
 
-func TestCloseStoresRetainedExports(t *testing.T) {
-	t.Parallel()
-
-	cacheDir := t.TempDir()
-	exportData := []byte("uFAKE")
-	body := goArchive(goPkgdef(exportData), bytes.Repeat([]byte("object data"), 1024))
-	outputID := bytes.Repeat([]byte{56}, 32)
-	livePaths := make([]string, 0, 2)
-	for i := range 2 {
-		st, err := newStore(config{
-			dir: cacheDir,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		res, err := st.put(request{
-			ID:       1,
-			Command:  cmdPut,
-			ActionID: bytes.Repeat([]byte{byte(57 + i)}, 32),
-			OutputID: outputID,
-			BodySize: int64(len(body)),
-		}, bufio.NewReader(encodedBody(body)))
-		if err != nil {
-			t.Fatal(err)
-		}
-		st.close()
-		livePaths = append(livePaths, res.DiskPath)
-	}
-
-	exportPath := retainedPath(cacheDir, outputID, ".a")
-	if got := readExportData(t, exportPath); !bytes.Equal(got, exportData) {
-		t.Fatalf("retained export data = %q, want %q", got, exportData)
-	}
-	for _, livePath := range livePaths {
-		if got := readExportData(t, livePath); !bytes.Equal(got, exportData) {
-			t.Fatalf("export data = %q, want %q", got, exportData)
-		}
-	}
-}
-
-func TestReuseRetainedArchiveWithoutWritingRetainedDir(t *testing.T) {
-	t.Parallel()
-
-	dir := t.TempDir()
-	livePath := filepath.Join(dir, "live.a")
-	retainedDir := filepath.Join(dir, "retained")
-	retainedPath := filepath.Join(retainedDir, "export.a")
-	body := goArchive(goPkgdef([]byte("uFAKE")), []byte("object data"))
-	if err := os.WriteFile(livePath, body, 0o666); err != nil {
-		t.Fatal(err)
-	}
-	if retained, err := stripPackageArchiveToExport(livePath, retainedPath); err != nil || !retained {
-		t.Fatalf("initial retention = %t, err=%v", retained, err)
-	}
-	if err := os.Remove(livePath); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(livePath, body, 0o666); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(retainedDir, 0o555); err != nil {
-		t.Fatal(err)
-	}
-	defer os.Chmod(retainedDir, 0o755) //nolint:errcheck
-	probe, err := os.CreateTemp(retainedDir, "permission-probe-")
-	if err == nil {
-		_ = probe.Close()
-		_ = os.Remove(probe.Name())
-		t.Skip("directory write permissions are not enforced")
-	}
-	if !errors.Is(err, os.ErrPermission) {
-		t.Fatal(err)
-	}
-	if retained, err := stripPackageArchiveToExport(livePath, retainedPath); err != nil || !retained {
-		t.Fatalf("reuse in read-only retained dir = %t, err=%v", retained, err)
-	}
-	if got := readExportData(t, livePath); !bytes.Equal(got, []byte("uFAKE")) {
-		t.Fatalf("reused export data = %q", got)
-	}
-}
-
-func TestRetainedFileReusePreservesValidation(t *testing.T) {
-	t.Parallel()
-
-	dir := t.TempDir()
-	livePath := filepath.Join(dir, "live.a")
-	retainedPath := filepath.Join(dir, "retained", "export.a")
-	body := goArchive(goPkgdef([]byte("uFAKE")), []byte("object data"))
-	if err := os.WriteFile(livePath, body, 0o666); err != nil {
-		t.Fatal(err)
-	}
-	if retained, err := stripPackageArchiveToExport(livePath, retainedPath); err != nil || !retained {
-		t.Fatalf("initial retention = %t, err=%v", retained, err)
-	}
-	if err := os.Remove(livePath); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(livePath, body[:len(archiveMagic)+archiveHeaderLen], 0o666); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := stripPackageArchiveToExport(livePath, retainedPath); !errors.Is(err, io.EOF) {
-		t.Fatalf("truncated archive error = %v, want EOF", err)
-	}
-	if err := os.Remove(livePath); err != nil {
-		t.Fatal(err)
-	}
-	if err := retainEscapedFileWithFallback(livePath, retainedPath, nil); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("missing live file error = %v, want not exist", err)
-	}
-}
-
-func BenchmarkReuseRetainedFiles(b *testing.B) {
-	data := bytes.Repeat([]byte("retained export\n"), 1<<18)
-	for _, tt := range []struct {
-		name   string
-		body   []byte
-		retain func(string, string) error
-	}{
-		{
-			name: "archive",
-			body: goArchive(goPkgdef(data), []byte("object data")),
-			retain: func(path, retainedPath string) error {
-				retained, err := stripPackageArchiveToExport(path, retainedPath)
-				if err == nil && !retained {
-					return errors.New("package archive was not retained")
-				}
-				return err
-			},
-		},
-		{
-			name: "file",
-			body: data,
-			retain: func(path, retainedPath string) error {
-				return retainEscapedFileWithFallback(path, retainedPath, nil)
-			},
-		},
-	} {
-		b.Run("kind="+tt.name, func(b *testing.B) {
-			dir := b.TempDir()
-			livePath := filepath.Join(dir, "live")
-			retainedPath := filepath.Join(dir, "retained", "export")
-			if err := os.WriteFile(livePath, tt.body, 0o666); err != nil {
-				b.Fatal(err)
-			}
-			if err := tt.retain(livePath, retainedPath); err != nil {
-				b.Fatal(err)
-			}
-			b.ReportAllocs()
-			b.ResetTimer()
-			b.StopTimer()
-			for range b.N {
-				if err := os.Remove(livePath); err != nil {
-					b.Fatal(err)
-				}
-				if err := os.WriteFile(livePath, tt.body, 0o666); err != nil {
-					b.Fatal(err)
-				}
-				b.StartTimer()
-				if err := tt.retain(livePath, retainedPath); err != nil {
-					b.Fatal(err)
-				}
-				b.StopTimer()
-			}
-		})
-	}
-}
-
-func TestPruneRemovesOrphanRetainedFiles(t *testing.T) {
-	t.Parallel()
-
-	for _, tt := range retainedFileCases(t) {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			cacheDir := t.TempDir()
-			st, err := newStore(config{dir: cacheDir})
-			if err != nil {
-				t.Fatal(err)
-			}
-			outputID := bytes.Repeat([]byte{62}, 32)
-			referencedID := bytes.Repeat([]byte{63}, 32)
-			for i, id := range [][]byte{outputID, referencedID} {
-				if _, err := st.put(request{
-					ID:       int64(i + 1),
-					Command:  cmdPut,
-					ActionID: bytes.Repeat([]byte{byte(61 + i)}, 32),
-					OutputID: id,
-					BodySize: int64(len(tt.body)),
-				}, bufio.NewReader(encodedBody(tt.body))); err != nil {
-					st.close()
-					t.Fatal(err)
-				}
-			}
-			st.close()
-
-			st, err = newStore(config{dir: cacheDir})
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer st.close()
-			path := retainedPath(cacheDir, outputID, tt.ext)
-			if _, err := os.Stat(path); err != nil {
-				t.Fatal(err)
-			}
-			if err := st.q.deleteEntriesByOutputID(context.Background(), hexOf(outputID)); err != nil {
-				t.Fatal(err)
-			}
-			execDB(t, st.db, `DELETE FROM runs WHERE run_id = ?`, st.runID)
-			if err := st.prune(); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := os.Stat(path); !os.IsNotExist(err) {
-				t.Fatalf("orphan retained file stat err = %v, want not exist", err)
-			}
-			if _, err := os.Stat(retainedPath(cacheDir, referencedID, tt.ext)); err != nil {
-				t.Fatalf("referenced retained file was removed: %v", err)
-			}
-		})
-	}
-}
-
-func TestPruneRemovesOldRetainedFilesAndLiveDirs(t *testing.T) {
-	t.Parallel()
-
-	for _, tt := range retainedFileCases(t) {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			cacheDir := t.TempDir()
-			st, err := newStore(config{dir: cacheDir})
-			if err != nil {
-				t.Fatal(err)
-			}
-			outputID := bytes.Repeat([]byte{64}, 32)
-			res, err := st.put(request{
-				ID:       1,
-				Command:  cmdPut,
-				ActionID: bytes.Repeat([]byte{63}, 32),
-				OutputID: outputID,
-				BodySize: int64(len(tt.body)),
-			}, bufio.NewReader(encodedBody(tt.body)))
-			if err != nil {
-				st.close()
-				t.Fatal(err)
-			}
-			st.close()
-			path := retainedPath(cacheDir, outputID, tt.ext)
-			old := trimCutoff(defaultMaxAge, time.Now()).Add(-time.Minute)
-			for _, agedPath := range []string{path, filepath.Join(filepath.Dir(res.DiskPath), "run.lock")} {
-				if err := os.Chtimes(agedPath, old, old); err != nil {
-					t.Fatal(err)
-				}
-			}
-			st, err = newStore(config{dir: cacheDir, maxAge: defaultMaxAge})
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer st.close()
-			execDB(t, st.db, `DELETE FROM runs WHERE run_id = ?`, st.runID)
-			if err := st.prune(); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := os.Stat(path); !os.IsNotExist(err) {
-				t.Fatalf("old retained file stat err = %v, want not exist", err)
-			}
-			if _, err := os.Stat(res.DiskPath); !os.IsNotExist(err) {
-				t.Fatalf("old retained live file stat err = %v, want not exist", err)
-			}
-		})
-	}
-}
-
-func TestRetainedAgePruneCanBeDisabled(t *testing.T) {
-	t.Parallel()
-
-	st, err := newStore(config{dir: t.TempDir(), maxAge: 0})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.close()
-	outputID := strings.Repeat("a", 64)
-	for _, tt := range retainedFileCases(t) {
-		path := st.retainedPath(outputID, tt.ext)
-		if err := os.MkdirAll(filepath.Dir(path), 0o777); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(path, tt.body, 0o666); err != nil {
-			t.Fatal(err)
-		}
-		old := time.Now().Add(-2 * defaultMaxAge)
-		if err := os.Chtimes(path, old, old); err != nil {
-			t.Fatal(err)
-		}
-		if err := st.pruneOldRetainedFiles(time.Now()); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := os.Stat(path); err != nil {
-			t.Fatalf("age prune removed %s with maxAge disabled: %v", tt.ext, err)
-		}
-	}
-}
-
-func TestRefreshingRetainedFileDoesNotKeepOldLiveRun(t *testing.T) {
-	t.Parallel()
-
-	cacheDir := t.TempDir()
-	exportData := []byte("uFAKE")
-	body := goArchive(goPkgdef(exportData), bytes.Repeat([]byte("object data"), 1024))
-	outputID := bytes.Repeat([]byte{65}, 32)
-
-	st, err := newStore(config{
-		dir:    cacheDir,
-		maxAge: defaultMaxAge,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	first, err := st.put(request{
-		ID:       1,
-		Command:  cmdPut,
-		ActionID: bytes.Repeat([]byte{66}, 32),
-		OutputID: outputID,
-		BodySize: int64(len(body)),
-	}, bufio.NewReader(encodedBody(body)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	st.close()
-
-	old := trimCutoff(defaultMaxAge, time.Now()).Add(-time.Minute)
-	if err := os.Chtimes(filepath.Join(filepath.Dir(first.DiskPath), "run.lock"), old, old); err != nil {
-		t.Fatal(err)
-	}
-
-	st, err = newStore(config{
-		dir:    cacheDir,
-		maxAge: defaultMaxAge,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := st.q.setState(context.Background(), lastFullPruneStateKey, unixMillis(old)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.put(request{
-		ID:       2,
-		Command:  cmdPut,
-		ActionID: bytes.Repeat([]byte{67}, 32),
-		OutputID: outputID,
-		BodySize: int64(len(body)),
-	}, bufio.NewReader(encodedBody(body))); err != nil {
-		t.Fatal(err)
-	}
-	st.close()
-
-	if _, err := os.Stat(first.DiskPath); !os.IsNotExist(err) {
-		t.Fatalf("old retained live file stat err = %v, want not exist", err)
-	}
-	if _, err := os.Stat(retainedPath(cacheDir, outputID, ".a")); err != nil {
-		t.Fatalf("refreshed retained export was removed: %v", err)
-	}
-}
-
-func TestCloseRefreshesRetainedFileMTime(t *testing.T) {
-	t.Parallel()
-
-	for _, tt := range retainedFileCases(t) {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			cacheDir := t.TempDir()
-			outputID := bytes.Repeat([]byte{66}, 32)
-			for i := range 2 {
-				st, err := newStore(config{
-					dir:    cacheDir,
-					maxAge: defaultMaxAge,
-				})
-				if err != nil {
-					t.Fatal(err)
-				}
-				if _, err := st.put(request{
-					ID:       1,
-					Command:  cmdPut,
-					ActionID: bytes.Repeat([]byte{byte(67 + i)}, 32),
-					OutputID: outputID,
-					BodySize: int64(len(tt.body)),
-				}, bufio.NewReader(encodedBody(tt.body))); err != nil {
-					t.Fatal(err)
-				}
-				st.close()
-				if i == 0 {
-					path := retainedPath(cacheDir, outputID, tt.ext)
-					old := trimCutoff(defaultMaxAge, time.Now()).Add(-time.Minute)
-					if err := os.Chtimes(path, old, old); err != nil {
-						t.Fatal(err)
-					}
-				}
-			}
-			path := retainedPath(cacheDir, outputID, tt.ext)
-			info, err := os.Stat(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !info.ModTime().After(trimCutoff(defaultMaxAge, time.Now())) {
-				t.Fatalf("retained file mtime = %v, want refreshed after cutoff", info.ModTime())
-			}
-		})
-	}
-}
-
-func TestCloseRetainsGeneratedCgoSourceLiveFile(t *testing.T) {
-	t.Parallel()
-
-	body := []byte("// Code generated by cmd/cgo; DO NOT EDIT.\n\npackage net\n\nconst x = 1\n")
-	assertCloseRetainsGeneratedGoSource(t, body, bytes.Repeat([]byte{59}, 32), bytes.Repeat([]byte{60}, 32))
-}
-
-func TestCloseRetainsGeneratedTestmainLiveFile(t *testing.T) {
-	t.Parallel()
-
-	body := []byte("\n// Code generated by 'go test'. DO NOT EDIT.\n\npackage main\n\nfunc main() {}\n")
-	assertCloseRetainsGeneratedGoSource(t, body, bytes.Repeat([]byte{75}, 32), bytes.Repeat([]byte{76}, 32))
-}
-
-func TestCloseDoesNotRetainBinaryContainingCgoMarkers(t *testing.T) {
-	t.Parallel()
-
-	cgoPayload := "import_dynamic " + strings.Repeat("x ", 2) + "\"libc.so\"\n"
-	body := append([]byte{0x7f, 'E', 'L', 'F', 0}, []byte("package main\n"+generatedCgoDirective+cgoPayload)...)
-	cacheDir := t.TempDir()
-	st, err := newStore(config{dir: cacheDir})
-	if err != nil {
-		t.Fatal(err)
-	}
-	outputID := bytes.Repeat([]byte{77}, 32)
-	res, err := st.put(request{
-		ID:       1,
-		Command:  cmdPut,
-		ActionID: bytes.Repeat([]byte{78}, 32),
-		OutputID: outputID,
-		BodySize: int64(len(body)),
-	}, bufio.NewReader(encodedBody(body)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	st.close()
-
-	if _, err := os.Stat(res.DiskPath); !os.IsNotExist(err) {
-		t.Fatalf("binary live file stat err = %v, want not exist", err)
-	}
-	if _, err := os.Stat(retainedPath(cacheDir, outputID, ".go")); !os.IsNotExist(err) {
-		t.Fatalf("retained binary stat err = %v, want not exist", err)
-	}
-}
-
-func TestGeneratedSourceClassificationUsesBoundedPrefix(t *testing.T) {
-	t.Parallel()
-
-	data := bytes.Repeat([]byte("x"), generatedSourcePrefixLimit)
-	cgoPayload := "import_dynamic " + strings.Repeat("x ", 2) + "\"libc.so\"\n"
-	data = append(data, []byte("\npackage main\n"+generatedCgoDirective+cgoPayload)...)
-	path := filepath.Join(t.TempDir(), "large")
-	if err := os.WriteFile(path, data, 0o666); err != nil {
-		t.Fatal(err)
-	}
-	prefix, err := readFilePrefix(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(prefix) != generatedSourcePrefixLimit {
-		t.Fatalf("prefix length = %d, want %d", len(prefix), generatedSourcePrefixLimit)
-	}
-	if _, ok := retainedGeneratedSourceKind(prefix); ok {
-		t.Fatal("marker beyond classification prefix was accepted")
-	}
-}
-
-func assertCloseRetainsGeneratedGoSource(t *testing.T, body, actionID, outputID []byte) {
-	t.Helper()
-
-	cacheDir := t.TempDir()
-	st, err := newStore(config{
-		dir: cacheDir,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	res, err := st.put(request{
-		ID:       1,
-		Command:  cmdPut,
-		ActionID: actionID,
-		OutputID: outputID,
-		BodySize: int64(len(body)),
-	}, bufio.NewReader(encodedBody(body)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	st.close()
-
-	got, err := os.ReadFile(res.DiskPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, body) {
-		t.Fatalf("retained live source = %q, want %q", got, body)
-	}
-	retained, err := os.ReadFile(retainedPath(cacheDir, outputID, ".go"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(retained, body) {
-		t.Fatalf("retained source = %q, want %q", retained, body)
-	}
-}
-
 func TestPruneKeepsLiveBlobs(t *testing.T) {
 	t.Parallel()
 
@@ -2068,23 +1085,30 @@ func TestPruneKeepsLiveBlobs(t *testing.T) {
 
 	actionID := bytes.Repeat([]byte{7}, 32)
 	outputID := bytes.Repeat([]byte{8}, 32)
+	body := forkBody(70)
 	if _, err := st.put(request{
 		ID:       1,
 		Command:  cmdPut,
 		ActionID: actionID,
 		OutputID: outputID,
-		BodySize: 64,
-	}, bufio.NewReader(encodedBody(bytes.Repeat([]byte("x"), 64)))); err != nil {
+		BodySize: int64(len(body)),
+	}, bufio.NewReader(encodedBody(body))); err != nil {
 		t.Fatal(err)
 	}
+	if size := compressedSizeForTest(t, st); size <= st.maxSize {
+		t.Fatalf("stored size = %d, want above maxSize %d", size, st.maxSize)
+	}
+	execDB(t, st.db, `UPDATE entries SET accessed_at = ?`, unixMillis(time.Now().Add(-2*time.Hour)))
+	// The run stays registered: an active run blocks every deletion, however
+	// old the entry is.
 	if err := st.prune(); err != nil {
 		t.Fatal(err)
 	}
 	if _, found, err := st.lookupEntry(hexOf(actionID)); err != nil || !found {
 		t.Fatalf("live entry was pruned: found=%t, err=%v", found, err)
 	}
-	if _, err := os.Stat(st.blobPath(hexOf(outputID))); err != nil {
-		t.Fatalf("live blob was pruned: %v", err)
+	if _, err := os.Stat(st.storedPath(hexOf(outputID))); err != nil {
+		t.Fatalf("live stored file was pruned: %v", err)
 	}
 }
 
@@ -2137,13 +1161,7 @@ func TestAutomaticPruneSkipsRecentFullPrune(t *testing.T) {
 	defer st.close()
 
 	outputID := strings.Repeat("a", 64)
-	blobPath := st.blobPath(outputID)
-	if err := os.MkdirAll(filepath.Dir(blobPath), 0o777); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(blobPath, []byte("orphan"), 0o666); err != nil {
-		t.Fatal(err)
-	}
+	orphanPath := writeOrphanOutput(t, st, outputID)
 	execDB(t, st.db, `DELETE FROM runs WHERE run_id = ?`, st.runID)
 	now := time.Now()
 	if err := st.q.setState(context.Background(), lastFullPruneStateKey, unixMillis(now)); err != nil {
@@ -2153,7 +1171,7 @@ func TestAutomaticPruneSkipsRecentFullPrune(t *testing.T) {
 	if err := st.pruneAutomatically(now); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(blobPath); err != nil {
+	if _, err := os.Stat(orphanPath); err != nil {
 		t.Fatalf("recently pruned cache was pruned again: %v", err)
 	}
 }
@@ -2171,13 +1189,7 @@ func TestAutomaticPruneRunsFullPruneAfterInterval(t *testing.T) {
 	defer st.close()
 
 	outputID := strings.Repeat("a", 64)
-	blobPath := st.blobPath(outputID)
-	if err := os.MkdirAll(filepath.Dir(blobPath), 0o777); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(blobPath, []byte("orphan"), 0o666); err != nil {
-		t.Fatal(err)
-	}
+	orphanPath := writeOrphanOutput(t, st, outputID)
 	execDB(t, st.db, `DELETE FROM runs WHERE run_id = ?`, st.runID)
 	now := time.Now()
 	if err := st.q.setState(context.Background(), lastFullPruneStateKey, unixMillis(now.Add(-fullPruneInterval-time.Minute))); err != nil {
@@ -2187,8 +1199,8 @@ func TestAutomaticPruneRunsFullPruneAfterInterval(t *testing.T) {
 	if err := st.pruneAutomatically(now); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
-		t.Fatalf("orphan blob stat err = %v, want not exist", err)
+	if _, err := os.Stat(orphanPath); !os.IsNotExist(err) {
+		t.Fatalf("orphan stat err = %v, want not exist", err)
 	}
 	lastMillis, found, err := st.q.fullPruneState(context.Background())
 	if err != nil {
@@ -2226,53 +1238,6 @@ func TestAutomaticPruneDoesNotRecordSkippedPrune(t *testing.T) {
 	}
 }
 
-func TestAutomaticPruneEnforcesSizeWithActiveRuns(t *testing.T) {
-	t.Parallel()
-
-	cacheDir := t.TempDir()
-	st1, err := newStore(config{
-		dir:     cacheDir,
-		maxSize: 320,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st1.close()
-	st2, err := newStore(config{
-		dir:     cacheDir,
-		maxSize: 320,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st2.close()
-
-	outputIDs := addSizedCacheEntries(t, st1, time.Now(), 4, 100)
-	orphanID := strings.Repeat("f", 64)
-	if err := os.MkdirAll(st1.blobDir(orphanID), 0o777); err != nil {
-		t.Fatal(err)
-	}
-	orphanPath := st1.blobPath(orphanID)
-	if err := os.WriteFile(orphanPath, []byte("orphan"), 0o666); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := st1.pruneAutomatically(time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	if _, found, err := st1.q.fullPruneState(context.Background()); err != nil || found {
-		t.Fatalf("last full prune: found=%t, err=%v; want not found", found, err)
-	}
-	if _, err := os.Stat(orphanPath); err != nil {
-		t.Fatalf("orphan was removed while another run was active: %v", err)
-	}
-	for _, outputID := range outputIDs[:2] {
-		if _, err := os.Stat(st1.blobPath(outputID)); !os.IsNotExist(err) {
-			t.Fatalf("old blob %s stat err = %v, want not exist", outputID, err)
-		}
-	}
-}
-
 func TestAutomaticPruneEnforcesSizeBetweenFullPrunes(t *testing.T) {
 	t.Parallel()
 
@@ -2286,7 +1251,7 @@ func TestAutomaticPruneEnforcesSizeBetweenFullPrunes(t *testing.T) {
 	defer st.close()
 
 	now := time.Now()
-	outputIDs := addSizedCacheEntries(t, st, now, 4, 100)
+	outputIDs := addSizedCacheEntries(t, st, now.Add(-2*time.Hour), 4, 100)
 	execDB(t, st.db, `DELETE FROM runs WHERE run_id = ?`, st.runID)
 	if err := st.q.setState(context.Background(), lastFullPruneStateKey, unixMillis(now)); err != nil {
 		t.Fatal(err)
@@ -2303,13 +1268,13 @@ func TestAutomaticPruneEnforcesSizeBetweenFullPrunes(t *testing.T) {
 		t.Fatalf("compressed size after prune = %d, want 200", total)
 	}
 	for _, outputID := range outputIDs[:2] {
-		if _, err := os.Stat(st.blobPath(outputID)); !os.IsNotExist(err) {
-			t.Fatalf("old blob %s stat err = %v, want not exist", outputID, err)
+		if _, err := os.Stat(st.storedPath(outputID)); !os.IsNotExist(err) {
+			t.Fatalf("old output %s stat err = %v, want not exist", outputID, err)
 		}
 	}
 	for _, outputID := range outputIDs[2:] {
-		if _, err := os.Stat(st.blobPath(outputID)); err != nil {
-			t.Fatalf("new blob %s was pruned: %v", outputID, err)
+		if _, err := os.Stat(st.storedPath(outputID)); err != nil {
+			t.Fatalf("new output %s was pruned: %v", outputID, err)
 		}
 	}
 }
@@ -2339,8 +1304,8 @@ func TestAutomaticPruneDoesNotPruneBelowMaximum(t *testing.T) {
 		t.Fatalf("compressed size = %d, err=%v; want 300", total, err)
 	}
 	for _, outputID := range outputIDs {
-		if _, err := os.Stat(st.blobPath(outputID)); err != nil {
-			t.Fatalf("blob %s was pruned below maxSize: %v", outputID, err)
+		if _, err := os.Stat(st.storedPath(outputID)); err != nil {
+			t.Fatalf("output %s was pruned below maxSize: %v", outputID, err)
 		}
 	}
 }
@@ -2357,14 +1322,7 @@ func TestAutomaticPruneTreatsFutureTimestampAsDue(t *testing.T) {
 	}
 	defer st.close()
 
-	orphanID := strings.Repeat("f", 64)
-	if err := os.MkdirAll(st.blobDir(orphanID), 0o777); err != nil {
-		t.Fatal(err)
-	}
-	orphanPath := st.blobPath(orphanID)
-	if err := os.WriteFile(orphanPath, []byte("orphan"), 0o666); err != nil {
-		t.Fatal(err)
-	}
+	orphanPath := writeOrphanOutput(t, st, strings.Repeat("f", 64))
 	execDB(t, st.db, `DELETE FROM runs WHERE run_id = ?`, st.runID)
 	now := time.Now()
 	if err := st.q.setState(context.Background(), lastFullPruneStateKey, unixMillis(now.Add(time.Hour))); err != nil {
@@ -2375,7 +1333,7 @@ func TestAutomaticPruneTreatsFutureTimestampAsDue(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(orphanPath); !os.IsNotExist(err) {
-		t.Fatalf("orphan blob stat err = %v, want not exist", err)
+		t.Fatalf("orphan stat err = %v, want not exist", err)
 	}
 }
 
@@ -2399,12 +1357,12 @@ func TestCompressedSizeTracksDistinctOutputs(t *testing.T) {
 		CreatedAt:      now,
 		AccessedAt:     now,
 	}
-	if err := st.q.upsertEntry(context.Background(), entry1); err != nil {
+	if err := st.q.upsertEntry(context.Background(), entry1, nil); err != nil {
 		t.Fatal(err)
 	}
 	entry2 := entry1
 	entry2.ActionID = strings.Repeat("b", 64)
-	if err := st.q.upsertEntry(context.Background(), entry2); err != nil {
+	if err := st.q.upsertEntry(context.Background(), entry2, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := compressedSizeForTest(t, st); got != 40 {
@@ -2413,7 +1371,7 @@ func TestCompressedSizeTracksDistinctOutputs(t *testing.T) {
 
 	entry1.OutputID = output2
 	entry1.CompressedSize = 60
-	if err := st.q.upsertEntry(context.Background(), entry1); err != nil {
+	if err := st.q.upsertEntry(context.Background(), entry1, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := compressedSizeForTest(t, st); got != 100 {
@@ -2468,7 +1426,7 @@ func TestConcurrentStoresUpdateCompressedSize(t *testing.T) {
 					CreatedAt:      time.Now(),
 					AccessedAt:     time.Now(),
 				}
-				if err := st.q.upsertEntry(context.Background(), ent); err != nil {
+				if err := st.q.upsertEntry(context.Background(), ent, nil); err != nil {
 					errs <- err
 					return
 				}
@@ -2505,7 +1463,7 @@ func BenchmarkUpsertEntrySharedOutput(b *testing.B) {
 
 			b.ResetTimer()
 			for range b.N {
-				if err := st.q.upsertEntry(context.Background(), ent); err != nil {
+				if err := st.q.upsertEntry(context.Background(), ent, nil); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -2516,23 +1474,6 @@ func BenchmarkUpsertEntrySharedOutput(b *testing.B) {
 			}
 			if size != ent.CompressedSize {
 				b.Fatalf("compressed size = %d, want %d", size, ent.CompressedSize)
-			}
-		})
-	}
-}
-
-func BenchmarkUpdateRetainedTypeUnchanged(b *testing.B) {
-	for _, actions := range []int{84, 1000} {
-		b.Run(fmt.Sprintf("actions=%d", actions), func(b *testing.B) {
-			st, ent := benchmarkSharedOutputStore(b, actions)
-			if err := st.q.updateRetainedType(context.Background(), ent.OutputID, retainedTypeExportArchive); err != nil {
-				b.Fatal(err)
-			}
-			b.ResetTimer()
-			for range b.N {
-				if err := st.q.updateRetainedType(context.Background(), ent.OutputID, retainedTypeExportArchive); err != nil {
-					b.Fatal(err)
-				}
 			}
 		})
 	}
@@ -2553,7 +1494,7 @@ func benchmarkSharedOutputStore(b *testing.B, actions int) (*store, entry) {
 		CreatedAt:      now,
 		AccessedAt:     now,
 	}
-	if err := st.q.upsertEntry(context.Background(), ent); err != nil {
+	if err := st.q.upsertEntry(context.Background(), ent, nil); err != nil {
 		b.Fatal(err)
 	}
 	if err := st.db.withTx(context.Background(), func(conn *sqlite.Conn) error {
@@ -2590,7 +1531,7 @@ func TestCompressedSizeRejectsNegativeAdjustment(t *testing.T) {
 		CreatedAt:      now,
 		AccessedAt:     now,
 	}
-	if err := st.q.upsertEntry(context.Background(), ent); err != nil {
+	if err := st.q.upsertEntry(context.Background(), ent, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.q.setState(context.Background(), compressedSizeStateKey, 0); err != nil {
@@ -2613,8 +1554,9 @@ func TestFullPruneReconcilesCompressedSize(t *testing.T) {
 		name  string
 		prune func(*store, time.Time) error
 	}{
-		{"explicit", func(st *store, _ time.Time) error { return st.prune() }},
-		{"automatic", (*store).pruneAutomatically},
+		// The walk then replaces the counter with the stored total (T10), so this
+		// test stops at the row-based reconciliation that runs before it.
+		{"old-data", (*store).pruneOldDataLocked},
 	} {
 		for _, maxAge := range []time.Duration{0, defaultMaxAge} {
 			for _, expired := range []bool{false, true} {
@@ -2826,10 +1768,10 @@ func TestNewStoreUsesLifecycleLock(t *testing.T) {
 	t.Parallel()
 
 	cacheDir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(cacheDir, "v1"), 0o777); err != nil {
+	if err := os.MkdirAll(filepath.Join(cacheDir, "v2"), 0o777); err != nil {
 		t.Fatal(err)
 	}
-	lock := flock.New(filepath.Join(cacheDir, "v1", "lifecycle.lock"))
+	lock := flock.New(filepath.Join(cacheDir, "v2", "lifecycle.lock"))
 	if err := lock.Lock(); err != nil {
 		t.Fatal(err)
 	}
@@ -2877,16 +1819,17 @@ func TestPruneRemovesUnusedBlobs(t *testing.T) {
 	}
 	actionID := bytes.Repeat([]byte{9}, 32)
 	outputID := bytes.Repeat([]byte{10}, 32)
+	body := forkBody(71)
 	if _, err := st.put(request{
 		ID:       1,
 		Command:  cmdPut,
 		ActionID: actionID,
 		OutputID: outputID,
-		BodySize: 64,
-	}, bufio.NewReader(encodedBody(bytes.Repeat([]byte("x"), 64)))); err != nil {
+		BodySize: int64(len(body)),
+	}, bufio.NewReader(encodedBody(body))); err != nil {
 		t.Fatal(err)
 	}
-	blobPath := st.blobPath(hexOf(outputID))
+	storedPath := st.storedPath(hexOf(outputID))
 	st.close()
 
 	st, err = newStore(config{
@@ -2897,14 +1840,16 @@ func TestPruneRemovesUnusedBlobs(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.close()
+	execDB(t, st.db, `UPDATE entries SET accessed_at = ?`, unixMillis(time.Now().Add(-2*time.Hour)))
+	execDB(t, st.db, `DELETE FROM runs WHERE run_id = ?`, st.runID)
 	if err := st.prune(); err != nil {
 		t.Fatal(err)
 	}
 	if _, found, err := st.lookupEntry(hexOf(actionID)); err != nil || found {
 		t.Fatalf("entry was not pruned: found=%t, err=%v", found, err)
 	}
-	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
-		t.Fatalf("blob was not pruned: %v", err)
+	if _, err := os.Stat(storedPath); !os.IsNotExist(err) {
+		t.Fatalf("stored file was not pruned: %v", err)
 	}
 }
 
@@ -2920,21 +1865,13 @@ func TestPruneRemovesOrphanBlobsWithSizePruningDisabled(t *testing.T) {
 	}
 	defer st.close()
 
-	outputID := strings.Repeat("a", 64)
-	blobDir := st.blobDir(outputID)
-	if err := os.MkdirAll(blobDir, 0o777); err != nil {
-		t.Fatal(err)
-	}
-	blobPath := st.blobPath(outputID)
-	if err := os.WriteFile(blobPath, []byte("orphan"), 0o666); err != nil {
-		t.Fatal(err)
-	}
+	orphanPath := writeOrphanOutput(t, st, strings.Repeat("a", 64))
 	execDB(t, st.db, `DELETE FROM runs WHERE run_id = ?`, st.runID)
 	if err := st.prune(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
-		t.Fatalf("orphan blob stat err = %v, want not exist", err)
+	if _, err := os.Stat(orphanPath); !os.IsNotExist(err) {
+		t.Fatalf("orphan stat err = %v, want not exist", err)
 	}
 }
 
@@ -2954,7 +1891,7 @@ func TestCatalogQueriesRespectCanceledContext(t *testing.T) {
 	if _, err := st.q.listOtherRuns(ctx, st.runID); err == nil {
 		t.Fatal("listOtherRuns succeeded with canceled context")
 	}
-	if _, err := st.q.pruneCandidates(ctx); err == nil {
+	if _, err := st.q.pruneCandidates(ctx, 0); err == nil {
 		t.Fatal("pruneCandidates succeeded with canceled context")
 	}
 	if err := st.q.referencedOutputIDs(ctx, "00", "01", make(map[string]struct{})); err == nil {
@@ -2979,28 +1916,21 @@ func TestPruneUsesBlobLRU(t *testing.T) {
 	newSharedActionID := bytes.Repeat([]byte{13}, 32)
 	prunedOutputID := bytes.Repeat([]byte{14}, 32)
 	prunedActionID := bytes.Repeat([]byte{15}, 32)
-	body := bytes.Repeat([]byte("x"), 64)
 
 	for _, tc := range []struct {
 		actionID []byte
 		outputID []byte
+		body     []byte
 	}{
-		{oldSharedActionID, sharedOutputID},
-		{newSharedActionID, sharedOutputID},
-		{prunedActionID, prunedOutputID},
+		{oldSharedActionID, sharedOutputID, forkBody(1)},
+		{newSharedActionID, sharedOutputID, forkBody(1)},
+		{prunedActionID, prunedOutputID, forkBody(2)},
 	} {
-		if _, err := st.put(request{
-			ID:       1,
-			Command:  cmdPut,
-			ActionID: tc.actionID,
-			OutputID: tc.outputID,
-			BodySize: int64(len(body)),
-		}, bufio.NewReader(encodedBody(body))); err != nil {
-			t.Fatal(err)
-		}
+		forkPut(t, st, tc.actionID, tc.outputID, tc.body)
 	}
 
-	recent := unixMillis(time.Now())
+	// Every row is older than the 1 hour floor, so the size prune may remove it.
+	recent := unixMillis(time.Now().Add(-2 * time.Hour))
 	execDB(t, st.db,
 		`UPDATE entries SET accessed_at = ? WHERE action_id = ?`,
 		recent-3000,
@@ -3017,16 +1947,16 @@ func TestPruneUsesBlobLRU(t *testing.T) {
 		hexOf(prunedActionID),
 	)
 
-	total, err := st.compressedSize()
-	if err != nil {
-		t.Fatal(err)
-	}
-	prunedInfo, err := os.Stat(st.blobPath(hexOf(prunedOutputID)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	st.maxSize = total - prunedInfo.Size()
 	execDB(t, st.db, `DELETE FROM runs WHERE run_id = ?`, st.runID)
+	// The prune first sets the counter to the bytes on disk under v2/, catalog
+	// files included. The limit allows the shared output and the catalog, and
+	// not the pruned output; the slack covers catalog growth during the prune.
+	total, err := storedBytesUnder(st.versionDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prunedBytes := forkStoredBytes(forkLstat(t, st.storedPath(hexOf(prunedOutputID))))
+	st.maxSize = total - prunedBytes + 64<<10
 	if err := st.prune(); err != nil {
 		t.Fatal(err)
 	}
@@ -3040,7 +1970,7 @@ func TestPruneUsesBlobLRU(t *testing.T) {
 	if _, found, err := st.lookupEntry(hexOf(newSharedActionID)); err != nil || !found {
 		t.Fatalf("shared output new action was pruned: found=%t, err=%v", found, err)
 	}
-	if _, err := os.Stat(st.blobPath(hexOf(sharedOutputID))); err != nil {
+	if _, err := os.Stat(st.storedPath(hexOf(sharedOutputID))); err != nil {
 		t.Fatalf("shared output blob was pruned: %v", err)
 	}
 }
@@ -3065,26 +1995,18 @@ func TestPruneRemovesEntriesOlderThanTrimLimit(t *testing.T) {
 	sharedOutputID := bytes.Repeat([]byte{24}, 32)
 	oldSharedActionID := bytes.Repeat([]byte{25}, 32)
 	freshSharedActionID := bytes.Repeat([]byte{26}, 32)
-	body := bytes.Repeat([]byte("x"), 64)
 
 	for _, tc := range []struct {
 		actionID []byte
 		outputID []byte
+		body     []byte
 	}{
-		{oldActionID, oldOutputID},
-		{freshActionID, freshOutputID},
-		{oldSharedActionID, sharedOutputID},
-		{freshSharedActionID, sharedOutputID},
+		{oldActionID, oldOutputID, forkBody(1)},
+		{freshActionID, freshOutputID, forkBody(2)},
+		{oldSharedActionID, sharedOutputID, forkBody(3)},
+		{freshSharedActionID, sharedOutputID, forkBody(3)},
 	} {
-		if _, err := st.put(request{
-			ID:       1,
-			Command:  cmdPut,
-			ActionID: tc.actionID,
-			OutputID: tc.outputID,
-			BodySize: int64(len(body)),
-		}, bufio.NewReader(encodedBody(body))); err != nil {
-			t.Fatal(err)
-		}
+		forkPut(t, st, tc.actionID, tc.outputID, tc.body)
 	}
 
 	stale := unixMillis(trimCutoff(defaultMaxAge, time.Now())) - int64(time.Minute/time.Millisecond)
@@ -3096,6 +2018,12 @@ func TestPruneRemovesEntriesOlderThanTrimLimit(t *testing.T) {
 		)
 	}
 
+	// The walk removes the file of a deleted row once its mtime is past the floor.
+	twoHoursAgo := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(st.storedPath(hexOf(oldOutputID)), twoHoursAgo, twoHoursAgo); err != nil {
+		t.Fatal(err)
+	}
+
 	execDB(t, st.db, `DELETE FROM runs WHERE run_id = ?`, st.runID)
 	if err := st.prune(); err != nil {
 		t.Fatal(err)
@@ -3104,13 +2032,13 @@ func TestPruneRemovesEntriesOlderThanTrimLimit(t *testing.T) {
 	if _, found, err := st.lookupEntry(hexOf(oldActionID)); err != nil || found {
 		t.Fatalf("stale entry was not pruned: found=%t, err=%v", found, err)
 	}
-	if _, err := os.Stat(st.blobPath(hexOf(oldOutputID))); !os.IsNotExist(err) {
+	if _, err := os.Stat(st.storedPath(hexOf(oldOutputID))); !os.IsNotExist(err) {
 		t.Fatalf("stale entry blob stat err = %v, want not exist", err)
 	}
 	if _, found, err := st.lookupEntry(hexOf(freshActionID)); err != nil || !found {
 		t.Fatalf("fresh entry was pruned: found=%t, err=%v", found, err)
 	}
-	if _, err := os.Stat(st.blobPath(hexOf(freshOutputID))); err != nil {
+	if _, err := os.Stat(st.storedPath(hexOf(freshOutputID))); err != nil {
 		t.Fatalf("fresh entry blob was pruned: %v", err)
 	}
 	if _, found, err := st.lookupEntry(hexOf(oldSharedActionID)); err != nil || found {
@@ -3119,7 +2047,7 @@ func TestPruneRemovesEntriesOlderThanTrimLimit(t *testing.T) {
 	if _, found, err := st.lookupEntry(hexOf(freshSharedActionID)); err != nil || !found {
 		t.Fatalf("fresh shared action was pruned: found=%t, err=%v", found, err)
 	}
-	if _, err := os.Stat(st.blobPath(hexOf(sharedOutputID))); err != nil {
+	if _, err := os.Stat(st.storedPath(hexOf(sharedOutputID))); err != nil {
 		t.Fatalf("shared output blob was pruned while still referenced: %v", err)
 	}
 }
@@ -3381,7 +2309,7 @@ func TestRunHelpDoesNotCreateCacheState(t *testing.T) {
 	if err := run([]string{"clean", "-h", "-dir", cacheDir}, strings.NewReader(""), &bytes.Buffer{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(cacheDir, "v1")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(cacheDir, "v2")); !os.IsNotExist(err) {
 		t.Fatalf("help created cache state: %v", err)
 	}
 }
@@ -3398,7 +2326,7 @@ func TestRunCleanRemovesInactiveState(t *testing.T) {
 	}
 	actionID := bytes.Repeat([]byte{43}, 32)
 	outputID := bytes.Repeat([]byte{44}, 32)
-	res, err := st.put(request{
+	_, err = st.put(request{
 		ID:       1,
 		Command:  cmdPut,
 		ActionID: actionID,
@@ -3408,7 +2336,7 @@ func TestRunCleanRemovesInactiveState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	blobPath := st.blobPath(hexOf(outputID))
+	storedFile := st.storedPath(hexOf(outputID))
 	dbPath := filepath.Join(st.versionDir, "cache.db")
 	st.close()
 
@@ -3419,11 +2347,8 @@ func TestRunCleanRemovesInactiveState(t *testing.T) {
 	if stdout.Len() != 0 {
 		t.Fatalf("clean stdout = %q, want empty", stdout.String())
 	}
-	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
+	if _, err := os.Stat(storedFile); !os.IsNotExist(err) {
 		t.Fatalf("blob stat err = %v, want not exist", err)
-	}
-	if _, err := os.Stat(res.DiskPath); !os.IsNotExist(err) {
-		t.Fatalf("live file stat err = %v, want not exist", err)
 	}
 	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
 		t.Fatalf("catalog stat err = %v, want not exist", err)
@@ -3444,7 +2369,7 @@ func TestRunCleanKeepsActiveState(t *testing.T) {
 
 	actionID := bytes.Repeat([]byte{45}, 32)
 	outputID := bytes.Repeat([]byte{46}, 32)
-	res, err := st.put(request{
+	_, err = st.put(request{
 		ID:       1,
 		Command:  cmdPut,
 		ActionID: actionID,
@@ -3454,16 +2379,13 @@ func TestRunCleanKeepsActiveState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	blobPath := st.blobPath(hexOf(outputID))
+	storedFile := st.storedPath(hexOf(outputID))
 
 	if err := run([]string{"clean", "-dir", cacheDir}, strings.NewReader(""), &bytes.Buffer{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(blobPath); err != nil {
+	if _, err := os.Stat(storedFile); err != nil {
 		t.Fatalf("active blob was removed: %v", err)
-	}
-	if _, err := os.Stat(res.DiskPath); err != nil {
-		t.Fatalf("active live file was removed: %v", err)
 	}
 	if _, found, err := st.lookupEntry(hexOf(actionID)); err != nil || !found {
 		t.Fatalf("active entry was removed: found=%t, err=%v", found, err)
@@ -3482,7 +2404,7 @@ func TestRunCleanRemovesAbandonedState(t *testing.T) {
 	}
 	actionID := bytes.Repeat([]byte{47}, 32)
 	outputID := bytes.Repeat([]byte{48}, 32)
-	res, err := st.put(request{
+	_, err = st.put(request{
 		ID:       1,
 		Command:  cmdPut,
 		ActionID: actionID,
@@ -3492,7 +2414,7 @@ func TestRunCleanRemovesAbandonedState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	blobPath := st.blobPath(hexOf(outputID))
+	storedFile := st.storedPath(hexOf(outputID))
 	runDir := st.runDir
 	abandonStore(t, st)
 
@@ -3502,10 +2424,7 @@ func TestRunCleanRemovesAbandonedState(t *testing.T) {
 	if _, err := os.Stat(runDir); !os.IsNotExist(err) {
 		t.Fatalf("abandoned run dir stat err = %v, want not exist", err)
 	}
-	if _, err := os.Stat(res.DiskPath); !os.IsNotExist(err) {
-		t.Fatalf("abandoned live file stat err = %v, want not exist", err)
-	}
-	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
+	if _, err := os.Stat(storedFile); !os.IsNotExist(err) {
 		t.Fatalf("abandoned blob stat err = %v, want not exist", err)
 	}
 }
@@ -3537,13 +2456,9 @@ func TestRunStatusEmptyCache(t *testing.T) {
 	assertContains(t, got, "Original output size    0B")
 	assertContains(t, got, "Compressed cache blobs  0B (0 files)")
 	assertContains(t, got, "Blob max usage          0B / 20.0GiB (0.0%, 20.0GiB remaining)")
-	assertContains(t, got, "Retained go-list files  0B (0 files)")
-	assertContains(t, got, "Total stored            0B")
 	assertContains(t, got, "Blob-only savings       0B (0.0%)")
-	assertContains(t, got, "Overall savings         0B (0.0%)")
 	assertContains(t, got, "Compressed blob contents:\n")
 	assertContains(t, got, "None      0        0B      0B  0B (0.0%)")
-	assertContains(t, got, "Retained go-list files:\n")
 }
 
 func TestStatusDoesNotWaitForLifecycleLock(t *testing.T) {
@@ -3632,10 +2547,7 @@ func TestRunStatusInactiveCache(t *testing.T) {
 	assertContains(t, got, "Original output size")
 	assertContains(t, got, "Compressed cache blobs")
 	assertContains(t, got, "Blob max usage")
-	assertContains(t, got, "Retained go-list files")
-	assertContains(t, got, "Total stored")
 	assertContains(t, got, "Blob-only savings")
-	assertContains(t, got, "Overall savings")
 	assertContains(t, got, "Compressed blob contents:")
 	assertContains(t, got, "Text files      1        4B")
 }
@@ -3733,53 +2645,6 @@ func TestRunStatusShowsBlobTypes(t *testing.T) {
 	assertContains(t, got, "Go coverage metadata")
 }
 
-func TestRunStatusShowsRetainedFileTypes(t *testing.T) {
-	t.Parallel()
-
-	cacheDir := t.TempDir()
-	st, err := newStore(config{
-		dir: cacheDir,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	exportData := []byte("uFAKE")
-	entries := []struct {
-		actionID byte
-		outputID byte
-		body     []byte
-	}{
-		{77, 78, goArchive(goPkgdef(exportData), bytes.Repeat([]byte("object data"), 16))},
-		{75, 76, indexedExportData(t)},
-		{79, 80, []byte("// Code generated by cmd/cgo; DO NOT EDIT.\n\npackage net\n\nconst x = 1\n")},
-		{81, 82, []byte("\n// Code generated by 'go test'. DO NOT EDIT.\n\npackage main\n\nfunc main() {}\n")},
-	}
-	for _, entry := range entries {
-		if _, err := st.put(request{
-			ID:       1,
-			Command:  cmdPut,
-			ActionID: bytes.Repeat([]byte{entry.actionID}, 32),
-			OutputID: bytes.Repeat([]byte{entry.outputID}, 32),
-			BodySize: int64(len(entry.body)),
-		}, bufio.NewReader(encodedBody(entry.body))); err != nil {
-			t.Fatal(err)
-		}
-	}
-	st.close()
-
-	var stdout bytes.Buffer
-	if err := run([]string{"status", "-dir", cacheDir}, strings.NewReader(""), &stdout); err != nil {
-		t.Fatal(err)
-	}
-	got := stdout.String()
-	assertContains(t, got, "Retained go-list files")
-	assertContains(t, got, "Export archives")
-	assertContains(t, got, "Indexed export data")
-	assertContains(t, got, "Generated cgo sources")
-	assertContains(t, got, "Generated test mains")
-}
-
 func TestRunStatusCountsUnreadableBlobTypes(t *testing.T) {
 	t.Parallel()
 
@@ -3801,9 +2666,9 @@ func TestRunStatusCountsUnreadableBlobTypes(t *testing.T) {
 	}, bufio.NewReader(encodedBody([]byte("body")))); err != nil {
 		t.Fatal(err)
 	}
-	blobPath := st.blobPath(hexOf(outputID))
+	storedPath := st.storedPath(hexOf(outputID))
 	st.close()
-	if err := os.WriteFile(blobPath, []byte("not zstd"), 0o666); err != nil {
+	if err := os.Remove(storedPath); err != nil {
 		t.Fatal(err)
 	}
 
@@ -3837,10 +2702,10 @@ func TestStatusCachesBlobTypes(t *testing.T) {
 	}
 	st.close()
 
-	versionDir, blobsDir, _, _ := cachePaths(config{dir: cacheDir})
+	versionDir, outputsDir, _, _ := cachePaths(config{dir: cacheDir})
 	dbPath := filepath.Join(versionDir, "cache.db")
 
-	statuses, err := readBlobTypeStatus(dbPath, blobsDir)
+	statuses, err := readBlobTypeStatus(dbPath, outputsDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3848,10 +2713,10 @@ func TestStatusCachesBlobTypes(t *testing.T) {
 
 	// Removing the blob forces the second pass to rely on the cached
 	// classification; if it decompressed it would report the blob unreadable.
-	if err := os.Remove(blobPath(blobsDir, hexOf(outputID))); err != nil {
+	if err := os.Remove(storedPath(outputsDir, hexOf(outputID))); err != nil {
 		t.Fatal(err)
 	}
-	statuses, err = readBlobTypeStatus(dbPath, blobsDir)
+	statuses, err = readBlobTypeStatus(dbPath, outputsDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3879,14 +2744,14 @@ func TestStatusReclassifiesWhenClassifierVersionChanges(t *testing.T) {
 	}
 	st.close()
 
-	versionDir, blobsDir, _, _ := cachePaths(config{dir: cacheDir})
+	versionDir, outputsDir, _, _ := cachePaths(config{dir: cacheDir})
 	dbPath := filepath.Join(versionDir, "cache.db")
 
 	// Seed a wrong classification recorded under a different classifier version.
 	execCatalog(t, dbPath, `UPDATE entries SET blob_type = ?, blob_type_version = ?`,
 		int64(blobTypeText), int64(blobClassifierVersion+1))
 
-	statuses, err := readBlobTypeStatus(dbPath, blobsDir)
+	statuses, err := readBlobTypeStatus(dbPath, outputsDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3902,79 +2767,6 @@ func TestStatusReclassifiesWhenClassifierVersionChanges(t *testing.T) {
 	if !version.ok || version.value != int64(blobClassifierVersion) {
 		t.Fatalf("cached blob_type_version = %v, want %d", version, blobClassifierVersion)
 	}
-}
-
-func TestStatusCachesRetainedTypes(t *testing.T) {
-	t.Parallel()
-
-	cacheDir := t.TempDir()
-	st, err := newStore(config{dir: cacheDir})
-	if err != nil {
-		t.Fatal(err)
-	}
-	body := []byte("// Code generated by cmd/cgo; DO NOT EDIT.\n\npackage net\n\nconst x = 1\n")
-	outputID := bytes.Repeat([]byte{94}, 32)
-	if _, err := st.put(request{
-		ID:       1,
-		Command:  cmdPut,
-		ActionID: bytes.Repeat([]byte{93}, 32),
-		OutputID: outputID,
-		BodySize: int64(len(body)),
-	}, bufio.NewReader(encodedBody(body))); err != nil {
-		t.Fatal(err)
-	}
-	st.close()
-
-	versionDir := cacheVersionDir(config{dir: cacheDir})
-	dbPath := filepath.Join(versionDir, "cache.db")
-	outputHex := hexOf(outputID)
-
-	// New retained files are classified when they are created.
-	var kind, version optionalInt64
-	queryCatalog(t, dbPath, `SELECT retained_type, retained_type_version FROM entries WHERE output_id = ?`,
-		[]any{outputHex}, &kind, &version)
-	if !kind.ok || retainedTypeKind(kind.value) != retainedTypeGeneratedCgoSource {
-		t.Fatalf("cached retained_type = %v, want %d", kind, retainedTypeGeneratedCgoSource)
-	}
-	if !version.ok || version.value != int64(retainedClassifierVersion) {
-		t.Fatalf("cached retained_type_version = %v, want %d", version, retainedClassifierVersion)
-	}
-
-	// Simulate an older cache and verify status backfills its classification.
-	execCatalog(t, dbPath, `UPDATE entries SET retained_type = NULL, retained_type_version = NULL WHERE output_id = ?`, outputHex)
-	_, _, outputs, err := readCatalogStatus(dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, _, statuses, err := readRetainedStatus(dbPath, retainedRoot(versionDir), outputs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertRetainedKind(t, statuses, retainedTypeGeneratedCgoSource, 1)
-
-	queryCatalog(t, dbPath, `SELECT retained_type, retained_type_version FROM entries WHERE output_id = ?`,
-		[]any{outputHex}, &kind, &version)
-	if !kind.ok || retainedTypeKind(kind.value) != retainedTypeGeneratedCgoSource {
-		t.Fatalf("backfilled retained_type = %v, want %d", kind, retainedTypeGeneratedCgoSource)
-	}
-	if !version.ok || version.value != int64(retainedClassifierVersion) {
-		t.Fatalf("backfilled retained_type_version = %v, want %d", version, retainedClassifierVersion)
-	}
-
-	// Changing the file contents proves the next pass uses the cached value.
-	retainedPath := filepath.Join(retainedRoot(versionDir), outputHex[:2], outputHex+".go")
-	if err := os.WriteFile(retainedPath, []byte("// Code generated by 'go test'. DO NOT EDIT.\n\npackage main\n"), 0o666); err != nil {
-		t.Fatal(err)
-	}
-	_, _, outputs, err = readCatalogStatus(dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, _, statuses, err = readRetainedStatus(dbPath, retainedRoot(versionDir), outputs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertRetainedKind(t, statuses, retainedTypeGeneratedCgoSource, 1)
 }
 
 func TestUpsertEntryInvalidatesClassificationsOnOutputChange(t *testing.T) {
@@ -3993,120 +2785,35 @@ func TestUpsertEntryInvalidatesClassificationsOnOutputChange(t *testing.T) {
 	now := time.Now()
 	base := entry{ActionID: actionID, OutputID: output1, Size: 1, CompressedSize: 1, CreatedAt: now, AccessedAt: now}
 
-	if err := st.q.upsertEntry(ctx, base); err != nil {
+	if err := st.q.upsertEntry(ctx, base, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.q.updateBlobType(ctx, output1, blobTypeGoPackageArchive, blobClassifierVersion); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.q.updateRetainedType(ctx, output1, retainedTypeExportArchive); err != nil {
 		t.Fatal(err)
 	}
 
 	// Re-putting the action with a different output must drop stale classifications.
 	changed := base
 	changed.OutputID = output2
-	if err := st.q.upsertEntry(ctx, changed); err != nil {
+	if err := st.q.upsertEntry(ctx, changed, nil); err != nil {
 		t.Fatal(err)
 	}
-	var blobType, retainedType optionalInt64
-	queryDB(t, st.db, `SELECT blob_type, retained_type FROM entries WHERE action_id = ?`, []any{actionID}, &blobType, &retainedType)
+	var blobType optionalInt64
+	queryDB(t, st.db, `SELECT blob_type FROM entries WHERE action_id = ?`, []any{actionID}, &blobType)
 	if blobType.ok {
 		t.Fatalf("blob_type = %d after output change, want NULL", blobType.value)
-	}
-	if retainedType.ok {
-		t.Fatalf("retained_type = %d after output change, want NULL", retainedType.value)
 	}
 
 	// Re-putting with the same output preserves cached classifications.
 	if err := st.q.updateBlobType(ctx, output2, blobTypeGoSource, blobClassifierVersion); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.q.updateRetainedType(ctx, output2, retainedTypeGeneratedCgoSource); err != nil {
+	if err := st.q.upsertEntry(ctx, changed, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.q.upsertEntry(ctx, changed); err != nil {
-		t.Fatal(err)
-	}
-	queryDB(t, st.db, `SELECT blob_type, retained_type FROM entries WHERE action_id = ?`, []any{actionID}, &blobType, &retainedType)
+	queryDB(t, st.db, `SELECT blob_type FROM entries WHERE action_id = ?`, []any{actionID}, &blobType)
 	if !blobType.ok || blobTypeKind(blobType.value) != blobTypeGoSource {
 		t.Fatalf("blob_type = %v after same-output re-put, want %d", blobType, blobTypeGoSource)
-	}
-	if !retainedType.ok || retainedTypeKind(retainedType.value) != retainedTypeGeneratedCgoSource {
-		t.Fatalf("retained_type = %v after same-output re-put, want %d", retainedType, retainedTypeGeneratedCgoSource)
-	}
-}
-
-func TestUpdateRetainedTypeSkipsUnchanged(t *testing.T) {
-	t.Parallel()
-
-	st, err := newStore(config{dir: t.TempDir()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.close()
-	outputID := hexOf(sha256Sum(nil))
-	now := time.Now()
-	for i := range 5 {
-		if err := st.upsertEntry(entry{
-			ActionID:       fmt.Sprintf("%064x", i+1),
-			OutputID:       outputID,
-			CompressedSize: 13,
-			CreatedAt:      now,
-			AccessedAt:     now,
-		}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for i, classification := range []struct {
-		kind    retainedTypeKind
-		version any
-	}{
-		{retainedTypeExportArchive, retainedClassifierVersion},
-		{retainedTypeGeneratedCgoSource, retainedClassifierVersion},
-		{retainedTypeExportArchive, retainedClassifierVersion - 1},
-		{retainedTypeExportArchive, nil},
-	} {
-		execDB(t, st.db, `UPDATE entries SET retained_type = ?, retained_type_version = ? WHERE action_id = ?`,
-			int64(classification.kind), classification.version, fmt.Sprintf("%064x", i+1))
-	}
-	if err := st.db.withConn(context.Background(), func(conn *sqlite.Conn) error {
-		return sqlitex.ExecuteScript(conn, `
-CREATE TABLE retained_updates(action_id TEXT);
-CREATE TRIGGER log_retained_update AFTER UPDATE OF retained_type, retained_type_version ON entries
-BEGIN
-	INSERT INTO retained_updates VALUES (NEW.action_id);
-END;`, nil)
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.q.updateRetainedType(context.Background(), outputID, retainedTypeExportArchive); err != nil {
-		t.Fatal(err)
-	}
-	var updates, classified int64
-	queryDB(t, st.db, `SELECT COUNT(*) FROM retained_updates`, nil, &updates)
-	if updates != 4 {
-		t.Fatalf("classification updates = %d, want 4 changed or missing classifications", updates)
-	}
-	queryDB(t, st.db, `SELECT COUNT(*) FROM entries WHERE retained_type = ? AND retained_type_version = ?`,
-		[]any{int64(retainedTypeExportArchive), retainedClassifierVersion}, &classified)
-	if classified != 5 {
-		t.Fatalf("classified entries = %d, want 5", classified)
-	}
-	execDB(t, st.db, `DELETE FROM retained_updates`)
-	if err := st.q.updateRetainedType(context.Background(), outputID, retainedTypeExportArchive); err != nil {
-		t.Fatal(err)
-	}
-	queryDB(t, st.db, `SELECT COUNT(*) FROM retained_updates`, nil, &updates)
-	if updates != 0 {
-		t.Fatalf("unchanged classification updates = %d, want 0", updates)
-	}
-	if err := st.q.updateRetainedType(context.Background(), outputID, retainedTypeIndexedExportData); err != nil {
-		t.Fatal(err)
-	}
-	queryDB(t, st.db, `SELECT COUNT(*) FROM retained_updates`, nil, &updates)
-	if updates != 5 {
-		t.Fatalf("changed classification updates = %d, want 5", updates)
 	}
 }
 
@@ -4133,7 +2840,7 @@ CREATE INDEX entries_output_id ON entries(output_id)`, nil); err != nil {
 		t.Fatal(err)
 	}
 
-	for _, col := range []string{"blob_type", "blob_type_version", "retained_type", "retained_type_version"} {
+	for _, col := range []string{"blob_type", "blob_type_version"} {
 		if has, err := entriesHasColumn(conn, col); err != nil {
 			t.Fatal(err)
 		} else if has {
@@ -4149,7 +2856,7 @@ CREATE INDEX entries_output_id ON entries(output_id)`, nil); err != nil {
 		t.Fatal(err)
 	}
 
-	for _, col := range []string{"blob_type", "blob_type_version", "retained_type", "retained_type_version"} {
+	for _, col := range []string{"blob_type", "blob_type_version"} {
 		if has, err := entriesHasColumn(conn, col); err != nil {
 			t.Fatal(err)
 		} else if !has {
@@ -4183,7 +2890,8 @@ func TestReopenCacheReordersOutputCoverIndex(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body := []byte("existing cache artifact")
+	// A resource-fork body has a row size above 0, so the counter bound below can fail.
+	body := forkBody(41)
 	actionID := sha256Sum([]byte("existing action"))
 	outputID := sha256Sum(body)
 	if _, err := st.put(request{
@@ -4201,11 +2909,15 @@ func TestReopenCacheReordersOutputCoverIndex(t *testing.T) {
 		st.close()
 		t.Fatalf("lookup original entry: found=%t, err=%v", found, err)
 	}
-	execDB(t, st.db, `UPDATE entries SET blob_type = 7, blob_type_version = 3, retained_type = 4, retained_type_version = 2`)
+	if original.CompressedSize <= 0 {
+		st.close()
+		t.Fatalf("original compressed size = %d, want above 0", original.CompressedSize)
+	}
+	execDB(t, st.db, `UPDATE entries SET blob_type = 7, blob_type_version = 3`)
 	if err := st.db.withConn(context.Background(), func(conn *sqlite.Conn) error {
 		return sqlitex.ExecuteScript(conn, `
 DROP INDEX entries_output_cover;
-CREATE INDEX entries_output_cover ON entries(output_id, size, compressed_size, blob_type, blob_type_version, retained_type, retained_type_version);
+CREATE INDEX entries_output_cover ON entries(output_id, size, compressed_size, blob_type, blob_type_version);
 `, nil)
 	}); err != nil {
 		st.close()
@@ -4227,22 +2939,24 @@ CREATE INDEX entries_output_cover ON entries(output_id, size, compressed_size, b
 			if ent != original {
 				t.Fatalf("migrated entry = %+v, want %+v", ent, original)
 			}
-			if got := compressedSizeForTest(t, st); got != original.CompressedSize {
-				t.Fatalf("compressed size = %d, want %d", got, original.CompressedSize)
+			// The first walk after open sets the counter to the stored total,
+			// which includes the catalog files.
+			if got := compressedSizeForTest(t, st); got < original.CompressedSize {
+				t.Fatalf("compressed size = %d, want at least %d", got, original.CompressedSize)
 			}
-			var version, blobType, blobVersion, retainedType, retainedVersion int64
+			var version, blobType, blobVersion int64
 			queryDB(t, st.db, `PRAGMA user_version`, nil, &version)
-			if version != 1 {
-				t.Fatalf("catalog version = %d, want existing version 1", version)
+			if version != cacheSchemaVersion {
+				t.Fatalf("catalog version = %d, want existing version %d", version, cacheSchemaVersion)
 			}
-			queryDB(t, st.db, `SELECT blob_type, blob_type_version, retained_type, retained_type_version FROM entries`, nil,
-				&blobType, &blobVersion, &retainedType, &retainedVersion)
-			if blobType != 7 || blobVersion != 3 || retainedType != 4 || retainedVersion != 2 {
-				t.Fatalf("classifications changed: %d/%d, %d/%d", blobType, blobVersion, retainedType, retainedVersion)
+			queryDB(t, st.db, `SELECT blob_type, blob_type_version FROM entries`, nil,
+				&blobType, &blobVersion)
+			if blobType != 7 || blobVersion != 3 {
+				t.Fatalf("classifications changed: %d/%d", blobType, blobVersion)
 			}
 			var columns string
 			queryDB(t, st.db, `SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_index_info('entries_output_cover') ORDER BY seqno)`, nil, &columns)
-			if want := "output_id,compressed_size,size,blob_type,blob_type_version,retained_type,retained_type_version"; columns != want {
+			if want := "output_id,compressed_size,size,blob_type,blob_type_version"; columns != want {
 				t.Fatalf("covering index columns = %q, want %q", columns, want)
 			}
 			if attempt == 0 {
@@ -4272,19 +2986,6 @@ func indexExists(conn *sqlite.Conn, name string) (bool, error) {
 }
 
 func assertBlobKind(t *testing.T, statuses []blobTypeStatus, kind blobTypeKind, count int64) {
-	t.Helper()
-	for _, status := range statuses {
-		if status.kind == kind {
-			if status.count != count {
-				t.Fatalf("kind %s count = %d, want %d", kind.label(), status.count, count)
-			}
-			return
-		}
-	}
-	t.Fatalf("kind %s not found in statuses", kind.label())
-}
-
-func assertRetainedKind(t *testing.T, statuses []retainedTypeStatus, kind retainedTypeKind, count int64) {
 	t.Helper()
 	for _, status := range statuses {
 		if status.kind == kind {
@@ -4635,87 +3336,6 @@ func TestResponseWriterKeepsFirstError(t *testing.T) {
 	}
 	if err := rw.err(); err == nil {
 		t.Fatal("err returned nil")
-	}
-}
-
-func TestCorruptBlobIsCacheMiss(t *testing.T) {
-	t.Parallel()
-
-	cacheDir := t.TempDir()
-	st, err := newStore(config{
-		dir: cacheDir,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	actionID := bytes.Repeat([]byte{28}, 32)
-	outputID := bytes.Repeat([]byte{29}, 32)
-	body := []byte("valid body")
-	if _, err := st.put(request{
-		ID:       1,
-		Command:  cmdPut,
-		ActionID: actionID,
-		OutputID: outputID,
-		BodySize: int64(len(body)),
-	}, bufio.NewReader(encodedBody(body))); err != nil {
-		t.Fatal(err)
-	}
-	blobPath := st.blobPath(hexOf(outputID))
-	st.close()
-
-	st, err = newStore(config{
-		dir: cacheDir,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.close()
-	if err := os.WriteFile(blobPath, []byte("not zstd"), 0o666); err != nil {
-		t.Fatal(err)
-	}
-
-	res, err := st.get(request{ID: 2, Command: cmdGet, ActionID: actionID})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !res.Miss {
-		t.Fatalf("get response = %+v, want miss", res)
-	}
-	if _, found, err := st.lookupEntry(hexOf(actionID)); err != nil || found {
-		t.Fatalf("entry remains after invalidation: found=%t, err=%v", found, err)
-	}
-	if _, err := os.Stat(blobPath); !os.IsNotExist(err) {
-		t.Fatalf("blob stat err = %v, want not exist", err)
-	}
-	if len(st.materializing) != 0 {
-		t.Fatal("failed materialization remains in flight")
-	}
-	res, err = st.put(request{
-		ID:       3,
-		Command:  cmdPut,
-		ActionID: actionID,
-		OutputID: outputID,
-		BodySize: int64(len(body)),
-	}, bufio.NewReader(encodedBody(body)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(res.DiskPath); err != nil {
-		t.Fatal(err)
-	}
-	res, err = st.get(request{ID: 4, Command: cmdGet, ActionID: actionID})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.Miss {
-		t.Fatal("get missed after replacing corrupt blob")
-	}
-	got, err := os.ReadFile(res.DiskPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, body) {
-		t.Fatalf("retried materialization = %q, want %q", got, body)
 	}
 }
 
@@ -5131,43 +3751,12 @@ func sha256Sum(data []byte) []byte {
 	return sum[:]
 }
 
-func writeCompressedFile(st *store, path string, body []byte) error {
-	var buf bytes.Buffer
-	enc, err := st.getEncoder(&buf)
-	if err != nil {
-		return err
-	}
-	if _, err := enc.Write(body); err != nil {
-		return err
-	}
-	if err := enc.Close(); err != nil {
-		return err
-	}
-	st.putEncoder(enc)
-	return os.WriteFile(path, buf.Bytes(), 0o666)
-}
-
 func goArchive(pkgdef, object []byte) []byte {
 	var buf bytes.Buffer
 	buf.WriteString(archiveMagic)
 	writeArchiveMember(&buf, pkgdefName, pkgdef)
 	writeArchiveMember(&buf, "_go_.o", object)
 	return buf.Bytes()
-}
-
-type retainedFileCase struct {
-	name string
-	ext  string
-	body []byte
-}
-
-func retainedFileCases(t *testing.T) []retainedFileCase {
-	t.Helper()
-	return []retainedFileCase{
-		{"archive", ".a", goArchive(goPkgdef([]byte("uFAKE")), bytes.Repeat([]byte("object data"), 1024))},
-		{"source", ".go", []byte(generatedTestmainSourcePrefix + "\nfunc main() {}\n")},
-		{"indexed", ".i", indexedExportData(t)},
-	}
 }
 
 func indexedExportData(t *testing.T) []byte {
@@ -5199,31 +3788,6 @@ func writeArchiveMember(buf *bytes.Buffer, name string, body []byte) {
 	}
 }
 
-func readExportData(t *testing.T, path string) []byte {
-	t.Helper()
-
-	file, err := os.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close() //nolint:errcheck
-
-	reader, err := gcexportdata.NewReader(file)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := io.ReadAll(reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return data
-}
-
-func retainedPath(cacheDir string, outputID []byte, ext string) string {
-	outputHex := hexOf(outputID)
-	return filepath.Join(cacheDir, "v1", retainedDirName, outputHex[:2], outputHex+ext)
-}
-
 func execDB(t *testing.T, db *sqliteDB, query string, args ...any) {
 	t.Helper()
 	err := db.withConn(context.Background(), func(conn *sqlite.Conn) error {
@@ -5242,10 +3806,10 @@ func addSizedCacheEntries(t *testing.T, st *store, now time.Time, count int, siz
 		actionID := fmt.Sprintf("%064x", i+1)
 		outputID := fmt.Sprintf("%064x", i+count+1)
 		outputIDs[i] = outputID
-		if err := os.MkdirAll(st.blobDir(outputID), 0o777); err != nil {
+		if err := os.MkdirAll(st.storedDir(outputID), 0o777); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(st.blobPath(outputID), []byte("blob"), 0o666); err != nil {
+		if err := os.WriteFile(st.storedPath(outputID), []byte("blob"), 0o666); err != nil {
 			t.Fatal(err)
 		}
 		if err := st.upsertEntry(entry{
@@ -5374,31 +3938,19 @@ func (errWriter) Write([]byte) (int, error) {
 	return 0, errors.New("write failed")
 }
 
-type recordingBodyWriter struct {
-	bytes.Buffer
-
-	writeSizes     []int
-	readFromCalled bool
-}
-
-func (w *recordingBodyWriter) Write(p []byte) (int, error) {
-	w.writeSizes = append(w.writeSizes, len(p))
-	return w.Buffer.Write(p)
-}
-
-func (w *recordingBodyWriter) ReadFrom(r io.Reader) (int64, error) {
-	w.readFromCalled = true
-	return io.Copy(struct{ io.Writer }{w}, r)
-}
-
+// removeFileReader removes path on its second Read. The put's first Read opens
+// the JSON string, so the second one comes after put has checked the stored
+// file and while it counts the body.
 type removeFileReader struct {
 	reader  io.Reader
 	path    string
+	reads   int
 	removed bool
 }
 
 func (r *removeFileReader) Read(p []byte) (int, error) {
-	if !r.removed {
+	r.reads++
+	if r.reads == 2 {
 		r.removed = true
 		if err := os.Remove(r.path); err != nil {
 			return 0, err
@@ -5413,4 +3965,22 @@ func strconvQuote(s string) string {
 		panic(err)
 	}
 	return string(b)
+}
+
+// writeOrphanOutput writes a stored file that no catalog row names and ages its
+// mtime past the one-hour floor, so the walk may remove it.
+func writeOrphanOutput(t *testing.T, st *store, outputID string) string {
+	t.Helper()
+	path := st.storedPath(outputID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("orphan"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }

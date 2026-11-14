@@ -2,36 +2,26 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
+	"syscall"
 	"time"
 
-	"github.com/gofrs/flock"
-	"github.com/klauspost/compress/zstd"
 	"zombiezen.com/go/sqlite"
 )
 
-var errInvalidCacheEntry = errors.New("invalid cache entry")
-
-type materialization struct {
-	done chan struct{}
-	path string
-	err  error
-}
-
 const (
-	// mtimeInterval mirrors cmd/go's DiskCache: retained-file mtimes are updated
-	// at most once per interval to avoid churn. The age cutoff itself is the
-	// configurable maxAge (see config); the default matches GOCACHE's 5 days.
+	// mtimeInterval is the age-prune margin: entries unused for maxAge plus this
+	// interval are pruned. The age cutoff itself is the configurable maxAge (see
+	// config); the default matches GOCACHE's 5 days.
 	mtimeInterval          = time.Hour
 	fullPruneInterval      = time.Hour
 	sizePruneTargetPercent = 90
@@ -39,14 +29,21 @@ const (
 	accessFlushInterval    = 30 * time.Second
 	accessFlushThreshold   = 256
 	accessFlushMinInterval = time.Second
-	putWriteBufferSize     = 32 * 1024
+
+	// useFloor is how long a returned path stays after its last use. cmd/go keeps
+	// the paths it got from get or put, so no prune deletes an output that was
+	// used less than this long ago.
+	useFloor = time.Hour
+
+	// storedBodyLimit is the first body size the writer rejects. The resource
+	// fork's offset table and the fsetxattr position are both uint32.
+	storedBodyLimit = 1 << 31
+
+	tempMarker = ".tmp-"
 )
 
-var decoderOptions = []zstd.DOption{
-	zstd.WithDecoderConcurrency(1),
-	zstd.WithDecoderLowmem(false),
-}
-
+// put stores the body as one compressed file at the output's stored path and
+// records the action. It writes nothing when a file of the right size is there.
 func (st *store) put(req request, br *bufio.Reader) (response, error) {
 	actionHex, err := idHex("ActionID", req.ActionID)
 	if err != nil {
@@ -66,189 +63,92 @@ func (st *store) put(req request, br *bufio.Reader) (response, error) {
 			_ = drainBody(body)
 		}
 	}()
-
-	blobDir := st.blobDir(outputHex)
-	if err := os.MkdirAll(blobDir, 0o777); err != nil {
-		return response{}, fmt.Errorf("create blob dir: %w", err)
+	if req.BodySize >= storedBodyLimit {
+		return response{}, fmt.Errorf("put body of %d bytes: stored files must be smaller than 2 GiB", req.BodySize)
 	}
-	blobPath := st.blobPath(outputHex)
-	compressedSize, blobExists := existingFileSize(blobPath)
 
-	bodyPath := st.reusableMaterializedPath(outputHex, req.BodySize)
-	keepBody := bodyPath != ""
-	if !keepBody {
-		bodyPath, err = st.createLiveFile(outputHex)
+	path := st.storedPath(outputHex)
+	if info, err := os.Lstat(path); err == nil && info.Mode().IsRegular() && info.Size() == req.BodySize {
+		// The file is already there. Count the body to keep the stream in step and
+		// to reject a body of the wrong size, but write nothing.
+		written, err := io.Copy(io.Discard, body)
 		if err != nil {
-			return response{}, err
+			return response{}, fmt.Errorf("read put body: %w", err)
 		}
-	}
-	defer func() {
-		if !keepBody {
-			_ = os.Remove(bodyPath)
+		bodyDrained = true
+		if written != req.BodySize {
+			return response{}, fmt.Errorf("put body size mismatch: got %d bytes, expected %d", written, req.BodySize)
 		}
-	}()
-
-	var bodyFile *os.File
-	var bodyBuffer *bufio.Writer
-	bodyWriter := io.Discard
-	if !keepBody {
-		bodyFile, err = os.Create(bodyPath)
-		if err != nil {
-			return response{}, fmt.Errorf("create live file: %w", err)
-		}
-		bodyWriter = bodyFile
-		if req.BodySize > 0 {
-			bodyBuffer = st.getBodyWriter(bodyFile)
-			defer st.putBodyWriter(bodyBuffer)
-			bodyWriter = bodyBuffer
-		}
+		return st.recordPut(req, actionHex, outputHex, path, allocatedBytes(info))
 	}
 
-	var written int64
-	if blobExists {
-		written, err = io.Copy(bodyWriter, body)
-	} else {
-		written, compressedSize, err = st.writeNewBlob(bodyWriter, body, blobDir, outputHex)
+	shardDir := filepath.Dir(path)
+	if err := os.MkdirAll(shardDir, 0o777); err != nil {
+		return response{}, fmt.Errorf("create output dir: %w", err)
 	}
-	var bodyFinishErr error
-	if bodyBuffer != nil {
-		if flushErr := bodyBuffer.Flush(); flushErr != nil {
-			bodyFinishErr = fmt.Errorf("flush live file: %w", flushErr)
-		}
-	}
-	if bodyFile != nil {
-		if closeErr := bodyFile.Close(); closeErr != nil {
-			bodyFinishErr = errors.Join(bodyFinishErr, fmt.Errorf("close live file: %w", closeErr))
-		}
-	}
+	tmpPath, err := st.writeStoredTemp(shardDir, outputHex, body, req.BodySize)
 	if err != nil {
-		return response{}, errors.Join(fmt.Errorf("read put body: %w", err), bodyFinishErr)
+		return response{}, err
 	}
 	bodyDrained = true
-	if bodyFinishErr != nil {
-		return response{}, bodyFinishErr
+	if err := publishStored(tmpPath, path, req.BodySize); err != nil {
+		return response{}, err
 	}
-	if written != req.BodySize {
-		return response{}, fmt.Errorf("put body size mismatch: got %d bytes, expected %d", written, req.BodySize)
+	info, err := os.Lstat(path)
+	if err != nil {
+		return response{}, fmt.Errorf("stat stored file: %w", err)
 	}
+	return st.recordPut(req, actionHex, outputHex, path, allocatedBytes(info))
+}
 
-	if blobExists {
-		if size, ok := existingFileSize(blobPath); ok {
-			compressedSize = size
-		} else {
-			compressedSize, err = st.compressLiveFile(bodyPath, blobDir, outputHex)
-			if err != nil {
-				return response{}, err
-			}
-		}
-	}
-
+// recordPut upserts the entry for a stored file. The upsert protects an output
+// that the entry displaces (see protectDisplaced) before it commits.
+func (st *store) recordPut(req request, actionHex, outputHex, path string, storedSize int64) (response, error) {
 	now := time.Now()
 	ent := entry{
 		ActionID:       actionHex,
 		OutputID:       outputHex,
-		Size:           written,
-		CompressedSize: compressedSize,
+		Size:           req.BodySize,
+		CompressedSize: storedSize,
 		CreatedAt:      now,
 		AccessedAt:     now,
 	}
 	if err := st.upsertEntry(ent); err != nil {
 		return response{}, err
 	}
-	keepBody = true
-	st.setMaterialized(outputHex, bodyPath)
-
-	return response{
-		ID:       req.ID,
-		DiskPath: bodyPath,
-	}, nil
+	return response{ID: req.ID, DiskPath: path}, nil
 }
 
-func (st *store) writeNewBlob(bodyWriter io.Writer, body io.Reader, blobDir, outputHex string) (int64, int64, error) {
-	blobTmp, err := os.CreateTemp(blobDir, outputHex+"-pending-*.zst")
-	if err != nil {
-		return 0, 0, fmt.Errorf("create compressed file: %w", err)
-	}
-	blobTmpPath := blobTmp.Name()
-	defer os.Remove(blobTmpPath) //nolint:errcheck
-
-	zw, err := st.getEncoder(blobTmp)
-	if err != nil {
-		_ = blobTmp.Close()
-		return 0, 0, fmt.Errorf("create zstd encoder: %w", err)
-	}
-	written, copyErr := io.Copy(io.MultiWriter(bodyWriter, zw), body)
-	encoderCloseErr := zw.Close()
-	st.putEncoder(zw)
-	blobCloseErr := blobTmp.Close()
-	if copyErr != nil {
-		return 0, 0, copyErr
-	}
-	if encoderCloseErr != nil {
-		return 0, 0, fmt.Errorf("finish zstd stream: %w", encoderCloseErr)
-	}
-	if blobCloseErr != nil {
-		return 0, 0, fmt.Errorf("close compressed file: %w", blobCloseErr)
-	}
-	compressedSize, err := st.installBlob(blobTmpPath, outputHex)
-	return written, compressedSize, err
-}
-
-func (st *store) compressLiveFile(bodyPath, blobDir, outputHex string) (int64, error) {
-	body, err := os.Open(bodyPath)
-	if err != nil {
-		return 0, fmt.Errorf("open live file for compression: %w", err)
-	}
-	defer body.Close() //nolint:errcheck
-
-	blobTmp, err := os.CreateTemp(blobDir, outputHex+"-pending-*.zst")
-	if err != nil {
-		return 0, fmt.Errorf("create compressed file: %w", err)
-	}
-	blobTmpPath := blobTmp.Name()
-	defer os.Remove(blobTmpPath) //nolint:errcheck
-
-	zw, err := st.getEncoder(blobTmp)
-	if err != nil {
-		_ = blobTmp.Close()
-		return 0, fmt.Errorf("create zstd encoder: %w", err)
-	}
-	_, copyErr := io.Copy(zw, body)
-	encoderCloseErr := zw.Close()
-	st.putEncoder(zw)
-	blobCloseErr := blobTmp.Close()
-	if copyErr != nil {
-		return 0, fmt.Errorf("compress live file: %w", copyErr)
-	}
-	if encoderCloseErr != nil {
-		return 0, fmt.Errorf("finish zstd stream: %w", encoderCloseErr)
-	}
-	if blobCloseErr != nil {
-		return 0, fmt.Errorf("close compressed file: %w", blobCloseErr)
-	}
-	return st.installBlob(blobTmpPath, outputHex)
-}
-
-func existingFileSize(path string) (int64, bool) {
-	info, err := os.Stat(path)
-	if err != nil || !info.Mode().IsRegular() {
-		return 0, false
-	}
-	return info.Size(), true
-}
-
-func (st *store) reusableMaterializedPath(outputID string, size int64) string {
-	st.mu.Lock()
-	path := st.materialized[outputID]
-	st.mu.Unlock()
-	if path != "" {
-		if existingSize, ok := existingFileSize(path); ok && existingSize == size {
-			return path
+// publishStored moves the temp file to its final path. link gives first-writer-
+// wins. When another writer published first, its file stays if its size
+// matches; a file of the wrong size is damaged and the temp file replaces it.
+func publishStored(tmpPath, path string, size int64) error {
+	err := os.Link(tmpPath, path)
+	switch {
+	case err == nil:
+	case errors.Is(err, fs.ErrExist):
+		info, statErr := os.Lstat(path)
+		if statErr == nil && info.Mode().IsRegular() && info.Size() == size {
+			break
 		}
+		if renameErr := os.Rename(tmpPath, path); renameErr != nil {
+			_ = os.Remove(tmpPath)
+			return fmt.Errorf("replace damaged stored file: %w", renameErr)
+		}
+		return nil
+	default:
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("publish stored file: %w", err)
 	}
-	return ""
+	if err := os.Remove(tmpPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("remove temp file: %w", err)
+	}
+	return nil
 }
 
+// get returns the stored path of the entry. It does not stat or read the file:
+// cmd/go checks the path itself and treats a missing or wrong-sized file as a
+// miss.
 func (st *store) get(req request) (response, error) {
 	actionHex, err := idHex("ActionID", req.ActionID)
 	if err != nil {
@@ -262,78 +162,18 @@ func (st *store) get(req request) (response, error) {
 		return response{}, err
 	}
 
-	path, err := st.getOrMaterialize(ent)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) || errors.Is(err, errInvalidCacheEntry) {
-			if deleteErr := st.deleteOutput(ent.OutputID); deleteErr != nil && st.verbose {
-				log.Printf("gocachez: delete bad cache output failed: %v", deleteErr)
-			}
-			return response{ID: req.ID, Miss: true}, nil
-		}
-		return response{}, err
-	}
-
-	st.markEntryAccess(actionHex)
-
 	outputID, err := hex.DecodeString(ent.OutputID)
 	if err != nil {
 		return response{}, fmt.Errorf("decode output ID: %w", err)
 	}
+	st.markEntryAccess(actionHex)
 	return response{
 		ID:       req.ID,
 		OutputID: outputID,
 		Size:     ent.Size,
 		Time:     &ent.CreatedAt,
-		DiskPath: path,
+		DiskPath: st.storedPath(ent.OutputID),
 	}, nil
-}
-
-func (st *store) getOrMaterialize(ent entry) (string, error) {
-	for {
-		st.mu.Lock()
-		path := st.materialized[ent.OutputID]
-		pending := st.materializing[ent.OutputID]
-		st.mu.Unlock()
-		if pending != nil {
-			<-pending.done
-			return pending.path, pending.err
-		}
-		if path != "" && regularFile(path) {
-			return path, nil
-		}
-
-		st.mu.Lock()
-		if st.materialized[ent.OutputID] != path || st.materializing[ent.OutputID] != nil {
-			st.mu.Unlock()
-			continue
-		}
-		pending = &materialization{done: make(chan struct{})}
-		st.materializing[ent.OutputID] = pending
-		st.mu.Unlock()
-
-		path, err := st.materialize(ent)
-		st.mu.Lock()
-		if err == nil {
-			st.materialized[ent.OutputID] = path
-		}
-		pending.path, pending.err = path, err
-		delete(st.materializing, ent.OutputID)
-		close(pending.done)
-		st.mu.Unlock()
-		return path, err
-	}
-}
-
-func (st *store) setMaterialized(outputID, path string) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.materialized[outputID] = path
-}
-
-func (st *store) deleteMaterialized(outputID string) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	delete(st.materialized, outputID)
 }
 
 func (st *store) markEntryAccess(actionID string) {
@@ -391,126 +231,24 @@ func (st *store) writeAccessTimes(accessed map[string]int64) error {
 	return err
 }
 
-func (st *store) materialize(ent entry) (string, error) {
-	bodyPath, err := st.createLiveFile(ent.OutputID)
-	if err != nil {
-		return "", err
-	}
-	keepBody := false
-	defer func() {
-		if !keepBody {
-			_ = os.Remove(bodyPath)
-		}
-	}()
-
-	blob, err := os.Open(st.blobPath(ent.OutputID))
-	if err != nil {
-		return "", err
-	}
-	defer blob.Close() //nolint:errcheck
-
-	zr, err := st.getDecoder(blob)
-	if err != nil {
-		return "", fmt.Errorf("%w: create zstd decoder: %w", errInvalidCacheEntry, err)
-	}
-	defer st.putDecoder(zr)
-
-	bodyFile, err := os.Create(bodyPath)
-	if err != nil {
-		return "", fmt.Errorf("create live file: %w", err)
-	}
-
-	written, copyErr := io.Copy(bodyFile, zr)
-	closeErr := bodyFile.Close()
-	if copyErr != nil {
-		return "", fmt.Errorf("%w: decompress cache entry: %w", errInvalidCacheEntry, copyErr)
-	}
-	if closeErr != nil {
-		return "", fmt.Errorf("close live file: %w", closeErr)
-	}
-	if written != ent.Size {
-		return "", fmt.Errorf("%w: decompressed size mismatch: got %d bytes, expected %d", errInvalidCacheEntry, written, ent.Size)
-	}
-
-	keepBody = true
-	return bodyPath, nil
-}
-
-func (st *store) getBodyWriter(w io.Writer) *bufio.Writer {
-	// Hide ReaderFrom so bufio cannot bypass buffering for os.File.
-	writer := struct{ io.Writer }{w}
-	if buf, ok := st.bodyWriterPool.Get().(*bufio.Writer); ok {
-		buf.Reset(writer)
-		return buf
-	}
-	return bufio.NewWriterSize(writer, putWriteBufferSize)
-}
-
-func (st *store) putBodyWriter(w *bufio.Writer) {
-	w.Reset(io.Discard)
-	st.bodyWriterPool.Put(w)
-}
-
-func (st *store) getEncoder(w io.Writer) (*zstd.Encoder, error) {
-	if enc, ok := st.encoderPool.Get().(*zstd.Encoder); ok {
-		enc.Reset(w)
-		return enc, nil
-	}
-	return zstd.NewWriter(w, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithEncoderCRC(true))
-}
-
-func (st *store) putEncoder(enc *zstd.Encoder) {
-	enc.Reset(io.Discard)
-	st.encoderPool.Put(enc)
-}
-
-func (st *store) getDecoder(r io.Reader) (*zstd.Decoder, error) {
-	if dec, ok := st.decoderPool.Get().(*zstd.Decoder); ok {
-		if err := dec.Reset(r); err != nil {
-			dec.Close()
-			return nil, err
-		}
-		return dec, nil
-	}
-	return zstd.NewReader(r, decoderOptions...)
-}
-
-func (st *store) putDecoder(dec *zstd.Decoder) {
-	_ = dec.Reset(bytes.NewReader(nil))
-	st.decoderPool.Put(dec)
-}
-
-func (st *store) createLiveFile(outputHex string) (string, error) {
-	file, err := os.CreateTemp(st.runDir, outputHex+"-*")
-	if err != nil {
-		return "", fmt.Errorf("create live file: %w", err)
-	}
-	path := file.Name()
-	if err := file.Close(); err != nil {
-		_ = os.Remove(path)
-		return "", fmt.Errorf("close live file placeholder: %w", err)
-	}
-	return path, nil
-}
-
-func (st *store) installBlob(tmpPath, outputHex string) (int64, error) {
-	dst := st.blobPath(outputHex)
-	if regularFile(dst) {
-		return fileSize(dst)
-	}
-	err := os.Rename(tmpPath, dst)
-	if err == nil {
-		return fileSize(dst)
-	}
-	if regularFile(dst) {
-		return fileSize(dst)
-	}
-	return 0, fmt.Errorf("install compressed file: %w", err)
-}
-
 func (st *store) upsertEntry(ent entry) error {
-	if err := st.q.upsertEntry(context.Background(), ent); err != nil {
+	if err := st.q.upsertEntry(context.Background(), ent, st.protectDisplaced); err != nil {
 		return fmt.Errorf("upsert entry: %w", err)
+	}
+	return nil
+}
+
+// protectDisplaced starts the floor for an output that an upsert is about to
+// leave without a row: it sets the stored file's times to now, because a run
+// that read the old row may still hold the path. A missing file needs no
+// protection. Any other error fails the upsert, so the old row stays.
+func (st *store) protectDisplaced(outputHex string) error {
+	if !validOutputHex(outputHex) {
+		return nil
+	}
+	now := time.Now()
+	if err := st.chtimes(st.storedPath(outputHex), now, now); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("protect displaced output %s: %w", outputHex, err)
 	}
 	return nil
 }
@@ -519,42 +257,25 @@ func (st *store) lookupEntry(actionID string) (entry, bool, error) {
 	return st.q.lookupEntry(context.Background(), actionID)
 }
 
-func (st *store) deleteOutput(outputID string) error {
-	if err := os.Remove(st.blobPath(outputID)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove bad blob: %w", err)
-	}
-	if err := st.q.deleteEntriesByOutputID(context.Background(), outputID); err != nil {
-		return fmt.Errorf("delete bad output entries: %w", err)
-	}
-	st.deleteMaterialized(outputID)
-	return nil
-}
-
+// prune runs every full-prune step now, if no run is active.
 func (st *store) prune() error {
 	return st.withLifecycleLock(func() error {
 		activeRuns, err := st.prepareToPruneLocked()
 		if err != nil || activeRuns > 0 {
 			return err
 		}
-		if err := st.pruneOldDataLocked(time.Now()); err != nil {
-			return err
-		}
-		if err := st.pruneSizeLocked(st.maxSize); err != nil {
-			return err
-		}
-		return st.removeOrphanOutputFiles(true)
+		return st.fullPruneLocked(time.Now(), st.maxSize)
 	})
 }
 
+// pruneAutomatically runs at close. Nothing is deleted while any run is
+// active: a run may hold a path that get or put returned. With no active run,
+// the size prune runs every time and the full prune runs once per hour.
 func (st *store) pruneAutomatically(now time.Time) error {
 	return st.withLifecycleLock(func() error {
 		activeRuns, err := st.prepareToPruneLocked()
-		if err != nil {
+		if err != nil || activeRuns > 0 {
 			return err
-		}
-
-		if activeRuns > 0 {
-			return st.pruneSizeWithHysteresis()
 		}
 
 		fullPruneDue, err := st.fullPruneDue(now)
@@ -562,27 +283,33 @@ func (st *store) pruneAutomatically(now time.Time) error {
 			return err
 		}
 		if !fullPruneDue {
-			return st.pruneSizeWithHysteresis()
+			return st.pruneSizeWithHysteresis(now)
 		}
-		if err := st.pruneOldDataLocked(now); err != nil {
-			return err
-		}
-		if err := st.pruneSizeWithHysteresis(); err != nil {
-			return err
-		}
-		if err := st.removeOrphanOutputFiles(true); err != nil {
+		if err := st.fullPruneLocked(now, st.maxSize*sizePruneTargetPercent/100); err != nil {
 			return err
 		}
 		return st.q.setState(context.Background(), lastFullPruneStateKey, unixMillis(now))
 	})
 }
 
-func (st *store) pruneSizeWithHysteresis() error {
+// fullPruneLocked ages out old entries, walks the outputs folder, and prunes by
+// size. The caller holds the lifecycle lock and has seen no active run.
+func (st *store) fullPruneLocked(now time.Time, target int64) error {
+	if err := st.pruneOldDataLocked(now); err != nil {
+		return err
+	}
+	if err := st.walkOutputs(now); err != nil {
+		return err
+	}
+	return st.pruneSizeLocked(target, now)
+}
+
+func (st *store) pruneSizeWithHysteresis(now time.Time) error {
 	if st.maxSize <= 0 {
 		return nil
 	}
 	target := st.maxSize * sizePruneTargetPercent / 100
-	return st.pruneSizeLocked(target)
+	return st.pruneSizeLocked(target, now)
 }
 
 func (st *store) prepareToPruneLocked() (int64, error) {
@@ -597,12 +324,6 @@ func (st *store) prepareToPruneLocked() (int64, error) {
 }
 
 func (st *store) pruneOldDataLocked(now time.Time) error {
-	if err := st.pruneOldRetainedFiles(now); err != nil {
-		return err
-	}
-	if err := st.pruneOldRetainedLiveDirs(now); err != nil {
-		return err
-	}
 	// Age-based entry deletion reconciles size in the same transaction.
 	if st.maxAge > 0 {
 		return st.pruneOldEntries(now)
@@ -613,7 +334,10 @@ func (st *store) pruneOldDataLocked(now time.Time) error {
 	return nil
 }
 
-func (st *store) pruneSizeLocked(target int64) error {
+// pruneSizeLocked deletes outputs, oldest last use first, once the counter is
+// above maxSize. It stops at target, and it never deletes an output that was
+// used less than useFloor ago.
+func (st *store) pruneSizeLocked(target int64, now time.Time) error {
 	if st.maxSize <= 0 {
 		return nil
 	}
@@ -625,7 +349,7 @@ func (st *store) pruneSizeLocked(target int64) error {
 		return nil
 	}
 
-	candidates, err := st.pruneCandidates()
+	candidates, err := st.pruneCandidates(now)
 	if err != nil {
 		return err
 	}
@@ -634,8 +358,8 @@ func (st *store) pruneSizeLocked(target int64) error {
 		if total <= target {
 			break
 		}
-		if err := os.Remove(st.blobPath(candidate.outputID)); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("remove compressed entry: %w", err)
+		if err := st.removeStored(candidate.outputID); err != nil {
+			return err
 		}
 		if err := st.q.deleteEntriesByOutputID(context.Background(), candidate.outputID); err != nil {
 			return fmt.Errorf("delete pruned entries: %w", err)
@@ -644,7 +368,19 @@ func (st *store) pruneSizeLocked(target int64) error {
 		removed++
 	}
 	if st.verbose && removed > 0 {
-		log.Printf("gocachez: pruned %d blobs, compressed size now %s", removed, formatSize(total))
+		log.Printf("gocachez: pruned %d outputs, stored size now %s", removed, formatSize(total))
+	}
+	return nil
+}
+
+// removeStored deletes the stored file of an output. A missing file is fine.
+// An output ID that is not lowercase hex names no stored file.
+func (st *store) removeStored(outputHex string) error {
+	if !validOutputHex(outputHex) {
+		return nil
+	}
+	if err := os.Remove(st.storedPath(outputHex)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("remove stored file: %w", err)
 	}
 	return nil
 }
@@ -677,8 +413,8 @@ func (st *store) compressedSize() (int64, error) {
 	return total, nil
 }
 
-func (st *store) pruneCandidates() ([]pruneCandidate, error) {
-	candidates, err := st.q.pruneCandidates(context.Background())
+func (st *store) pruneCandidates(now time.Time) ([]pruneCandidate, error) {
+	candidates, err := st.q.pruneCandidates(context.Background(), unixMillis(now.Add(-useFloor)))
 	if err != nil {
 		return nil, fmt.Errorf("query prune candidates: %w", err)
 	}
@@ -700,141 +436,19 @@ func (st *store) pruneOldEntries(now time.Time) error {
 	return nil
 }
 
-func (st *store) pruneOldRetainedFiles(now time.Time) error {
-	if st.maxAge <= 0 {
-		return nil
-	}
-	root := retainedRoot(st.versionDir)
-	if _, err := os.Stat(root); errors.Is(err, os.ErrNotExist) {
-		return nil
-	} else if err != nil {
-		return fmt.Errorf("stat retained root: %w", err)
-	}
-	cutoff := trimCutoff(st.maxAge, now)
-	shards, err := os.ReadDir(root)
-	if err != nil {
-		return fmt.Errorf("read retained root: %w", err)
-	}
-	removed := 0
-	for _, shard := range shards {
-		if !shard.IsDir() {
-			continue
-		}
-		shardPath := filepath.Join(root, shard.Name())
-		files, err := os.ReadDir(shardPath)
-		if err != nil {
-			return fmt.Errorf("read retained shard: %w", err)
-		}
-		for _, file := range files {
-			if file.IsDir() || !slices.Contains(retainedFileExtensions, filepath.Ext(file.Name())) {
-				continue
-			}
-			info, err := file.Info()
-			if err != nil {
-				return fmt.Errorf("stat retained file: %w", err)
-			}
-			if info.ModTime().Before(cutoff) {
-				if err := os.Remove(filepath.Join(shardPath, file.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
-					return fmt.Errorf("remove old retained file: %w", err)
-				}
-				removed++
-			}
-		}
-		removeDirIfEmpty(shardPath)
-	}
-	if st.verbose && removed > 0 {
-		log.Printf("gocachez: pruned %d old retained files", removed)
-	}
-	removeDirIfEmpty(root)
-	return nil
-}
-
-func (st *store) pruneOldRetainedLiveDirs(now time.Time) error {
-	if st.maxAge <= 0 {
-		return nil
-	}
-	entries, err := os.ReadDir(st.liveRoot)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("read live dir: %w", err)
-	}
-	cutoff := trimCutoff(st.maxAge, now)
-	removed := 0
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		runDir := filepath.Join(st.liveRoot, entry.Name())
-		runLock := flock.New(filepath.Join(runDir, "run.lock"))
-		locked, err := runLock.TryLock()
-		if err != nil {
-			_ = runLock.Close()
-			return fmt.Errorf("try lock retained live run %s: %w", entry.Name(), err)
-		}
-		if !locked {
-			_ = runLock.Close()
-			continue
-		}
-		expired, expireErr := retainedLiveRunExpired(runDir, cutoff)
-		unlockErr := runLock.Unlock()
-		closeErr := runLock.Close()
-		if expireErr != nil {
-			return expireErr
-		}
-		if unlockErr != nil {
-			return fmt.Errorf("unlock retained live run: %w", unlockErr)
-		}
-		if closeErr != nil {
-			return fmt.Errorf("close retained live run lock: %w", closeErr)
-		}
-		if expired {
-			if err := os.RemoveAll(runDir); err != nil {
-				return fmt.Errorf("remove old retained live run: %w", err)
-			}
-			removed++
-		}
-	}
-	if st.verbose && removed > 0 {
-		log.Printf("gocachez: pruned %d old retained live runs", removed)
-	}
-	return nil
-}
-
-func retainedLiveRunExpired(runDir string, cutoff time.Time) (bool, error) {
-	info, err := os.Stat(filepath.Join(runDir, "run.lock"))
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("stat retained live run: %w", err)
-	}
-	// Retained files are hard-linked into live runs, so their mtimes cannot
-	// represent the age of a particular run. The lock file is unique to the run
-	// and timestamped when that run closes.
-	return info.ModTime().Before(cutoff), nil
-}
-
 func trimCutoff(maxAge time.Duration, now time.Time) time.Time {
 	return now.Add(-maxAge - mtimeInterval)
 }
 
-func markRetainedFileUsed(path string) error {
-	info, err := os.Stat(path)
-	if err != nil {
-		return err
-	}
-	now := time.Now()
-	if now.Sub(info.ModTime()) < mtimeInterval {
-		return nil
-	}
-	return os.Chtimes(path, now, now)
-}
-
-func (st *store) removeOrphanOutputFiles(includeBlobs bool) error {
+// walkOutputs removes the files in the outputs folder that no row needs, then
+// sets the counter to the bytes on disk under the version folder. The caller
+// holds the lifecycle lock and has seen no active run, so every temp file
+// belongs to a dead writer. A file with no row stays until its mtime is older
+// than useFloor: a displaced output has no row but may still be in use.
+func (st *store) walkOutputs(now time.Time) error {
 	// Output files are already partitioned by the first byte of their hex ID.
 	// Reconcile one shard at a time to keep memory bounded without per-file SQL.
+	cutoff := now.Add(-useFloor)
 	referenced := make(map[string]struct{})
 	for shard := range 256 {
 		lower := fmt.Sprintf("%02x", shard)
@@ -845,21 +459,25 @@ func (st *store) removeOrphanOutputFiles(includeBlobs bool) error {
 		if err := st.q.referencedOutputIDs(context.Background(), lower, upper, referenced); err != nil {
 			return fmt.Errorf("query referenced outputs in shard %s: %w", lower, err)
 		}
-		if includeBlobs {
-			if err := removeOrphanFilesInDir(filepath.Join(st.blobsDir, lower), referenced, ".zst"); err != nil {
-				return fmt.Errorf("remove orphan blobs in shard %s: %w", lower, err)
-			}
+		if err := removeUnneededOutputFiles(filepath.Join(st.outputsDir, lower), referenced, cutoff); err != nil {
+			return fmt.Errorf("remove unneeded outputs in shard %s: %w", lower, err)
 		}
-		if err := removeOrphanFilesInDir(filepath.Join(retainedRoot(st.versionDir), lower), referenced, retainedFileExtensions...); err != nil {
-			return fmt.Errorf("remove orphan retained files in shard %s: %w", lower, err)
-		}
+	}
+	total, err := storedBytesUnder(st.versionDir)
+	if err != nil {
+		return fmt.Errorf("measure stored size: %w", err)
+	}
+	if err := st.q.setState(context.Background(), compressedSizeStateKey, total); err != nil {
+		return fmt.Errorf("set stored size: %w", err)
 	}
 	return nil
 }
 
-func removeOrphanFilesInDir(root string, referenced map[string]struct{}, extensions ...string) error {
-	entries, err := os.ReadDir(root)
-	if errors.Is(err, os.ErrNotExist) {
+// removeUnneededOutputFiles removes every temp file in dir, and every file that
+// is not in referenced and was last written before cutoff.
+func removeUnneededOutputFiles(dir string, referenced map[string]struct{}, cutoff time.Time) error {
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
@@ -869,41 +487,101 @@ func removeOrphanFilesInDir(root string, referenced map[string]struct{}, extensi
 		if entry.IsDir() {
 			continue
 		}
-		ext := filepath.Ext(entry.Name())
-		if !slices.Contains(extensions, ext) {
-			continue
-		}
-		outputID := strings.TrimSuffix(entry.Name(), ext)
-		if _, ok := referenced[outputID]; !ok {
-			if err := os.Remove(filepath.Join(root, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+		name := entry.Name()
+		if !strings.Contains(name, tempMarker) {
+			if _, ok := referenced[name]; ok {
+				continue
+			}
+			info, err := entry.Info()
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			if err != nil {
 				return err
 			}
+			if !info.ModTime().Before(cutoff) {
+				continue
+			}
+		}
+		if err := os.Remove(filepath.Join(dir, name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
 		}
 	}
-	removeDirIfEmpty(root)
+	removeDirIfEmpty(dir)
 	return nil
+}
+
+// storedBytesUnder sums the bytes on disk (st_blocks * 512) of every regular
+// file under root.
+func storedBytesUnder(root string) (int64, error) {
+	var total int64
+	err := filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		info, err := d.Info()
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		total += allocatedBytes(info)
+		return nil
+	})
+	return total, err
+}
+
+// allocatedBytes returns the bytes a file occupies on disk. A file compressed
+// by the file system reports its compressed size; one that is compressed inline
+// reports 0.
+func allocatedBytes(info fs.FileInfo) int64 {
+	if sys, ok := info.Sys().(*syscall.Stat_t); ok {
+		return sys.Blocks * 512
+	}
+	return info.Size()
 }
 
 func removeDirIfEmpty(path string) {
 	_ = os.Remove(path)
 }
 
-func (st *store) blobDir(outputHex string) string {
-	return blobDir(st.blobsDir, outputHex)
+// validOutputHex reports whether id can name a stored file: lowercase hex with
+// at least the two characters of its shard.
+func validOutputHex(id string) bool {
+	if len(id) < 2 {
+		return false
+	}
+	for _, c := range id {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
-func blobDir(blobsDir, outputHex string) string {
+func (st *store) storedDir(outputHex string) string {
+	return storedDir(st.outputsDir, outputHex)
+}
+
+func storedDir(outputsDir, outputHex string) string {
 	shard := "xx"
 	if len(outputHex) >= 2 {
 		shard = outputHex[:2]
 	}
-	return filepath.Join(blobsDir, shard)
+	return filepath.Join(outputsDir, shard)
 }
 
-func (st *store) blobPath(outputHex string) string {
-	return blobPath(st.blobsDir, outputHex)
+func (st *store) storedPath(outputHex string) string {
+	return storedPath(st.outputsDir, outputHex)
 }
 
-func blobPath(blobsDir, outputHex string) string {
-	return filepath.Join(blobDir(blobsDir, outputHex), outputHex+".zst")
+func storedPath(outputsDir, outputHex string) string {
+	return filepath.Join(storedDir(outputsDir, outputHex), outputHex)
 }
