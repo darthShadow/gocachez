@@ -174,6 +174,16 @@ WHERE output_id = ? AND action_id != ?`, []any{oldOutputID, ent.ActionID})
 			}
 			if others == 0 {
 				displacedOutputID = oldOutputID
+			} else {
+				// The replaced row may have handed out the shared output moments
+				// ago, with its access time still unflushed. The rows that keep
+				// the output carry that use, so the floor holds for it.
+				if err := execute(conn, `
+UPDATE entries
+SET accessed_at = MAX(accessed_at, ?)
+WHERE output_id = ?`, unixMillis(ent.AccessedAt), oldOutputID); err != nil {
+					return err
+				}
 			}
 		}
 		before, err := outputSizeSum(conn, outputIDs)

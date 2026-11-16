@@ -1291,9 +1291,14 @@ func TestAutomaticPruneDoesNotPruneBelowMaximum(t *testing.T) {
 	}
 	defer st.close()
 
+	// The rows are older than the floor and no run is registered, so only the
+	// size check keeps them.
 	now := time.Now()
-	outputIDs := addSizedCacheEntries(t, st, now, 3, 100)
+	outputIDs := addSizedCacheEntries(t, st, now.Add(-2*time.Hour), 3, 100)
 	if err := st.q.setState(context.Background(), lastFullPruneStateKey, unixMillis(now)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.q.deleteRun(context.Background(), st.runID); err != nil {
 		t.Fatal(err)
 	}
 

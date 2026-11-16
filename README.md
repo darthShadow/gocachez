@@ -68,7 +68,8 @@ $ gocachez clean
 ```
 
 `clean` removes the stored files and catalog state that no active `gocachez`
-process is using. Nothing is removed while a run is active.
+process is using. While a run is active, it removes only the folders of runs
+that no longer hold their lock.
 
 Show cache state:
 

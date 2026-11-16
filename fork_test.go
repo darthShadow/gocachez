@@ -723,6 +723,51 @@ func TestForkDisplacedOutputKeepsFileForFloor(t *testing.T) {
 	}
 }
 
+func TestForkSharedOutputKeepsFloorWhenOneActionIsReplaced(t *testing.T) {
+	t.Parallel()
+
+	st := newForkStore(t, config{})
+	defer st.close()
+	body1, body2 := forkBody(70), forkBody(71)
+	outputID1, outputID2 := sha256Sum(body1), sha256Sum(body2)
+	actionA, actionB := sha256Sum([]byte("shared action A")), sha256Sum([]byte("shared action B"))
+
+	path1 := forkPut(t, st, actionA, outputID1, body1).DiskPath
+	forkPut(t, st, actionB, outputID1, body1)
+	old := time.Now().Add(-3 * time.Hour)
+	forkSetAccessedAt(t, st, actionA, old)
+	forkSetAccessedAt(t, st, actionB, old)
+	if err := os.Chtimes(path1, old, old); err != nil {
+		t.Fatal(err)
+	}
+	// A tool takes the shared path through A now; the access is not flushed yet.
+	if res, err := st.get(request{ID: 2, Command: cmdGet, ActionID: actionA}); err != nil || res.Miss || res.DiskPath != path1 {
+		t.Fatalf("get A = %+v, err=%v", res, err)
+	}
+	// A moves to another output; B still names the shared one.
+	path2 := forkPut(t, st, actionA, outputID2, body2).DiskPath
+
+	forkGoIdle(t, st)
+	now := time.Now()
+	if err := st.q.setState(context.Background(), lastFullPruneStateKey, unixMillis(now)); err != nil {
+		t.Fatal(err)
+	}
+	// The counter holds both outputs, so it is above the maximum.
+	st.maxSize = forkEntry(t, st, actionA).CompressedSize
+	if err := st.pruneAutomatically(now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(path1); err != nil {
+		t.Errorf("shared output was handed out through A moments ago, but the idle prune removed it: %v", err)
+	}
+	if !forkHasEntry(t, st, actionB) {
+		t.Error("the row of B was pruned inside the floor of the shared output")
+	}
+	if _, err := os.Lstat(path2); err != nil {
+		t.Errorf("current output of A removed: %v", err)
+	}
+}
+
 func TestForkDisplacementFailsPutWhenChtimesFails(t *testing.T) {
 	t.Parallel()
 
